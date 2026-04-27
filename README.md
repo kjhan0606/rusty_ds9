@@ -6,6 +6,8 @@ astronomical FITS viewer originally written in Tcl/Tk by the Smithsonian Astroph
 This is a clean rewrite focused on the OGFinder-style workflow: open a FITS image, overlay a SExtractor catalog, draw and
 edit DS9 regions, and switch between multiple frames.
 
+> **Full manual:** [`docs/manual.md`](docs/manual.md) — menubar reference, WCS-region syntax, IPC protocol, cookbook.
+
 ## Build
 
 ```sh
