@@ -1,0 +1,714 @@
+// ds9-rust main window. Geometry mirrors SAOImage DS9 (menubar / info row /
+// colorbar | canvas | panner+magnifier / button row / status bar). Aesthetic
+// is intentional: deep slate background, teal accent, monospace readouts —
+// reads as a dark-room observatory console rather than a generic Material app.
+
+import { ScrollView } from "std-widgets.slint";
+
+// Markers are rendered in canvas/image-pixel space (0-based, top-left, y-down).
+// Conversion from DS9's 1-based, bottom-up FITS coords happens in Rust.
+struct Mark {
+    kind: int,     // 0 = circle, 1 = box (axis-aligned)
+    cx: float,     // image-space pixel center
+    cy: float,
+    rx: float,     // half-extent in x
+    ry: float,     // half-extent in y
+    color: color,
+}
+
+global Style {
+    out property <color> bg-deep:    #0b0e13;
+    out property <color> bg-panel:   #161b22;
+    out property <color> bg-sunken:  #0f1319;
+    out property <color> bg-hover:   #1f242c;
+    out property <color> bg-active:  #2a3038;
+    out property <color> bg-canvas:  #000000;
+    out property <color> border:     #2a3038;
+    out property <color> border-hi:  #3a424e;
+    out property <color> accent:     #4ec9b0;
+    out property <color> accent-dim: #2a665d;
+    out property <color> text:       #e6edf3;
+    out property <color> text-dim:   #7d8590;
+    out property <color> warn:       #ffa657;
+
+    out property <length> row-h-menu:   24px;
+    out property <length> row-h-info:   22px;
+    out property <length> row-h-mode:   30px;
+    out property <length> row-h-status: 22px;
+    out property <length> sidebar-w:    150px;
+    out property <length> colorbar-w:   28px;
+
+    out property <string> mono: "monospace";
+}
+
+component MenuBarItem inherits Rectangle {
+    in property <string> label;
+    in property <[string]> items;
+    callback chosen(string);
+
+    background: ta.has-hover ? Style.bg-hover : transparent;
+
+    HorizontalLayout {
+        padding-left:  10px;
+        padding-right: 10px;
+        Text {
+            text: root.label;
+            color: Style.text;
+            font-size: 12px;
+            vertical-alignment: center;
+        }
+    }
+
+    ta := TouchArea {
+        clicked => { popup.show(); }
+    }
+
+    popup := PopupWindow {
+        x: 0px;
+        y: root.height;
+        close-policy: close-on-click-outside;
+        Rectangle {
+            background: Style.bg-panel;
+            border-color: Style.border-hi;
+            border-width: 1px;
+            // shadow rule on top to anchor it visually under the menubar accent
+            Rectangle { y: 0px; height: 1px; background: Style.accent-dim; }
+            VerticalLayout {
+                padding-top:    4px;
+                padding-bottom: 4px;
+                spacing: 0px;
+                for item in root.items: Rectangle {
+                    height: item == "—" ? 7px : 22px;
+                    background: item == "—"
+                        ? transparent
+                        : (itemta.has-hover ? Style.bg-hover : transparent);
+                    if item == "—" : Rectangle {
+                        x: 8px; y: parent.height / 2;
+                        width: parent.width - 16px;
+                        height: 1px;
+                        background: Style.border;
+                    }
+                    if item != "—" : HorizontalLayout {
+                        padding-left:  14px;
+                        padding-right: 14px;
+                        Text {
+                            text: item;
+                            color: Style.text;
+                            font-size: 11px;
+                            font-family: Style.mono;
+                            vertical-alignment: center;
+                        }
+                    }
+                    itemta := TouchArea {
+                        enabled: item != "—";
+                        clicked => {
+                            root.chosen(item);
+                            popup.close();
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+component ModeButton inherits Rectangle {
+    in property <string> label;
+    in property <bool> active: false;
+    callback clicked;
+
+    border-radius: 3px;
+    border-width: 1px;
+    border-color: root.active ? Style.accent : Style.border;
+    background: ta.has-hover
+        ? Style.bg-hover
+        : (root.active ? Style.accent-dim : Style.bg-panel);
+
+    HorizontalLayout {
+        padding-left:  9px;
+        padding-right: 9px;
+        Text {
+            text: root.label;
+            color: root.active ? Style.text : Style.text-dim;
+            font-size: 11px;
+            vertical-alignment: center;
+        }
+    }
+    ta := TouchArea { clicked => { root.clicked(); } }
+}
+
+component InfoCell inherits Rectangle {
+    in property <string> caption;
+    in property <string> value;
+    HorizontalLayout {
+        padding-left: 6px;
+        padding-right: 6px;
+        spacing: 4px;
+        Text {
+            text: root.caption;
+            color: Style.text-dim;
+            font-size: 10px;
+            font-family: Style.mono;
+            vertical-alignment: center;
+        }
+        Text {
+            text: root.value;
+            color: Style.text;
+            font-size: 11px;
+            font-family: Style.mono;
+            vertical-alignment: center;
+        }
+    }
+}
+
+component Colorbar inherits Rectangle {
+    in property <image> strip;
+    in property <string> caption;
+    background: Style.bg-sunken;
+    border-color: Style.border;
+    border-width: 1px;
+    Image {
+        x: 4px; y: 4px;
+        width:  parent.width  - 8px;
+        height: parent.height - 8px;
+        source: root.strip;
+        image-rendering: smooth;
+        image-fit: fill;
+    }
+    Text {
+        x: 4px; y: parent.height - 14px;
+        text: root.caption;
+        color: Style.text;
+        font-size: 9px;
+        font-family: Style.mono;
+    }
+}
+
+/// Small thumbnail of the full image plus a viewport rect showing what the
+/// main canvas is currently looking at. DS9's Panner.
+component Panner inherits Rectangle {
+    in property <string> caption;
+    in property <image> source;
+    in property <int> img-w;
+    in property <int> img-h;
+    // current main-canvas viewport, expressed as image-pixel coords
+    in property <float> view-x;     // image-x at canvas origin
+    in property <float> view-y;
+    in property <float> view-w;     // image-pixels visible across canvas
+    in property <float> view-h;
+    callback panned(float, float);  // emits image-x, image-y of click
+
+    background: Style.bg-sunken;
+    border-color: Style.border;
+    border-width: 1px;
+
+    Text {
+        x: 6px; y: 4px;
+        text: root.caption;
+        color: Style.text-dim;
+        font-size: 10px;
+        font-family: Style.mono;
+    }
+
+    // The thumbnail occupies an inner box; we need its size to project
+    // viewport coords. Compute a contain-fit rect ourselves so the overlay
+    // rect lands on top of the actual image bounds (not the surrounding pad).
+    property <length> inner-x: 6px;
+    property <length> inner-y: 18px;
+    property <length> inner-w: root.width  - 12px;
+    property <length> inner-h: root.height - 22px;
+    property <float>  aspect-img: img-h > 0 ? (img-w / 1.0) / (img-h / 1.0) : 1.0;
+    property <float>  aspect-box: inner-h > 0px ? (inner-w / 1px) / (inner-h / 1px) : 1.0;
+    property <length> fit-w: aspect-img > aspect-box ? inner-w : inner-h * aspect-img;
+    property <length> fit-h: aspect-img > aspect-box ? inner-w / aspect-img : inner-h;
+    property <length> fit-x: inner-x + (inner-w - fit-w) / 2;
+    property <length> fit-y: inner-y + (inner-h - fit-h) / 2;
+
+    Image {
+        x: root.fit-x; y: root.fit-y;
+        width: root.fit-w; height: root.fit-h;
+        source: root.source;
+        image-rendering: smooth;
+        image-fit: fill;
+    }
+
+    // viewport rectangle (clamped into the thumbnail bounds)
+    if root.img-w > 0 && root.img-h > 0 && root.view-w > 0 && root.view-h > 0:
+    Rectangle {
+        property <length> sx: root.fit-w * (root.view-x / root.img-w);
+        property <length> sy: root.fit-h * (root.view-y / root.img-h);
+        property <length> sw: root.fit-w * (root.view-w / root.img-w);
+        property <length> sh: root.fit-h * (root.view-h / root.img-h);
+        x: root.fit-x + max(0px, min(root.fit-w, sx));
+        y: root.fit-y + max(0px, min(root.fit-h, sy));
+        width:  max(2px, min(root.fit-w - (self.x - root.fit-x), sw));
+        height: max(2px, min(root.fit-h - (self.y - root.fit-y), sh));
+        background: transparent;
+        border-color: Style.accent;
+        border-width: 1px;
+    }
+
+    // click anywhere in the thumbnail to recenter
+    TouchArea {
+        x: root.fit-x; y: root.fit-y;
+        width: root.fit-w; height: root.fit-h;
+        clicked => {
+            if (root.fit-w > 0px && root.fit-h > 0px) {
+                root.panned(
+                    (self.mouse-x / root.fit-w) * root.img-w,
+                    (self.mouse-y / root.fit-h) * root.img-h);
+            }
+        }
+    }
+}
+
+/// High-zoom view of the area around the cursor. DS9's Magnifier.
+component Magnifier inherits Rectangle {
+    in property <string> caption;
+    in property <image> source;
+    in property <int> img-w;
+    in property <int> img-h;
+    in property <float> cursor-x;   // image-pixel coord
+    in property <float> cursor-y;
+    in property <float> mag: 8.0;   // pixel-magnification factor
+
+    background: Style.bg-sunken;
+    border-color: Style.border;
+    border-width: 1px;
+
+    Text {
+        x: 6px; y: 4px;
+        text: root.caption;
+        color: Style.text-dim;
+        font-size: 10px;
+        font-family: Style.mono;
+    }
+
+    property <length> inner-x: 6px;
+    property <length> inner-y: 18px;
+    property <length> inner-w: root.width  - 12px;
+    property <length> inner-h: root.height - 22px;
+    property <float>  src-w-pix: max(1.0, (inner-w / 1px) / mag);
+    property <float>  src-h-pix: max(1.0, (inner-h / 1px) / mag);
+
+    Rectangle {
+        x: root.inner-x; y: root.inner-y;
+        width: root.inner-w; height: root.inner-h;
+        clip: true;
+        background: #000000;
+
+        if root.img-w > 0 && root.img-h > 0:
+        Image {
+            x: 0px; y: 0px;
+            width:  parent.width;
+            height: parent.height;
+            source: root.source;
+            image-rendering: pixelated;
+            image-fit: fill;
+            source-clip-x:      max(0, min(root.img-w - Math.round(root.src-w-pix),
+                                Math.round(root.cursor-x - root.src-w-pix / 2)));
+            source-clip-y:      max(0, min(root.img-h - Math.round(root.src-h-pix),
+                                Math.round(root.cursor-y - root.src-h-pix / 2)));
+            source-clip-width:  max(1, Math.round(root.src-w-pix));
+            source-clip-height: max(1, Math.round(root.src-h-pix));
+        }
+
+        // crosshair
+        Rectangle { x: parent.width / 2 - 0.5px; y: 0px; width: 1px;
+                    height: parent.height; background: #4ec9b080; }
+        Rectangle { x: 0px; y: parent.height / 2 - 0.5px; width: parent.width;
+                    height: 1px; background: #4ec9b080; }
+    }
+}
+
+export component MainWindow inherits Window {
+    title: "ds9-rust";
+    background: Style.bg-deep;
+    preferred-width:  1180px;
+    preferred-height: 760px;
+    min-width:  720px;
+    min-height: 480px;
+
+    // ---- image / data ----
+    in-out property <image> fits-image;
+    in-out property <int>   fits-width: 0;
+    in-out property <int>   fits-height: 0;
+
+    // ---- view state ----
+    in-out property <length> view-pan-x: 0px;
+    in-out property <length> view-pan-y: 0px;
+    in-out property <float>  view-zoom: 1.0;
+
+    // ---- pixel pipeline state (display only — Rust owns the truth) ----
+    in-out property <image>  colorbar-strip;
+    in-out property <string> active-cmap:    "grey";
+    in-out property <string> active-stretch: "linear";
+    in-out property <string> active-limits:  "zscale";
+
+    // ---- regions ----
+    in-out property <[Mark]> markers: [];
+
+    // ---- info readouts ----
+    in-out property <string> info-filename: "—";
+    in-out property <string> info-object:   "—";
+    in-out property <string> info-coords:   "x: ——      y: ——";
+    in-out property <string> info-value:    "value: ——";
+    in-out property <string> info-wcs:      "wcs: ——";
+    in-out property <string> status-text:   "ready";
+
+    // ---- mode ----
+    in-out property <string> active-mode: "pan";
+
+    // ---- last cursor position in image-pixel space (drives the magnifier) ----
+    in-out property <float> cursor-image-x: 0;
+    in-out property <float> cursor-image-y: 0;
+
+    // ---- main canvas viewport (image-pixel coords) — derived from the
+    //      canvas Rectangle's actual size, populated below ----
+    in-out property <length> canvas-w: 800px;
+    in-out property <length> canvas-h: 600px;
+    property <float>  vp-x: view-zoom > 0 ? -view-pan-x / 1px / view-zoom : 0;
+    property <float>  vp-y: view-zoom > 0 ? -view-pan-y / 1px / view-zoom : 0;
+    property <float>  vp-w: view-zoom > 0 ? canvas-w / 1px / view-zoom : 0;
+    property <float>  vp-h: view-zoom > 0 ? canvas-h / 1px / view-zoom : 0;
+
+    // ---- callbacks to Rust ----
+    callback request-open-file();
+    callback canvas-mouse-move(/*image-x*/ float, /*image-y*/ float);
+    callback canvas-clicked(/*image-x*/ float, /*image-y*/ float);
+    callback view-changed();
+    callback set-mode(string);
+    callback menu-action(/*menu*/ string, /*item*/ string);
+
+    function recenter-view-on(ix: float, iy: float) {
+        // place image-pixel (ix,iy) at the centre of the canvas
+        self.view-pan-x = self.canvas-w / 2 - ix * 1px * self.view-zoom;
+        self.view-pan-y = self.canvas-h / 2 - iy * 1px * self.view-zoom;
+    }
+
+    function set-zoom-anchored(new-zoom: float, ax: length, ay: length) {
+        // keep image-space point under (ax,ay) stationary
+        if (root.view-zoom > 0) {
+            self.view-pan-x = ax - (ax - self.view-pan-x) * (new-zoom / self.view-zoom);
+            self.view-pan-y = ay - (ay - self.view-pan-y) * (new-zoom / self.view-zoom);
+        }
+        self.view-zoom = new-zoom;
+    }
+
+    VerticalLayout {
+        spacing: 0px;
+
+        // ---------------- menu bar ----------------
+        Rectangle {
+            background: Style.bg-panel;
+            height: Style.row-h-menu;
+            HorizontalLayout {
+                spacing: 0px;
+                MenuBarItem {
+                    label: "File";
+                    items: ["Open…", "Save Image…", "—", "Print…", "—", "Quit"];
+                    chosen(it) => { root.menu-action("File", it); }
+                }
+                MenuBarItem {
+                    label: "Edit";
+                    items: ["Undo", "Redo", "—", "Cut", "Copy", "Paste"];
+                    chosen(it) => { root.menu-action("Edit", it); }
+                }
+                MenuBarItem {
+                    label: "View";
+                    items: ["Info Panel", "Panner", "Magnifier", "Buttons", "Colorbar"];
+                    chosen(it) => { root.menu-action("View", it); }
+                }
+                MenuBarItem {
+                    label: "Frame";
+                    items: ["New Frame", "Delete Frame", "—", "Next", "Previous", "—", "Match…"];
+                    chosen(it) => { root.menu-action("Frame", it); }
+                }
+                MenuBarItem {
+                    label: "Bin";
+                    items: ["1", "2", "4", "8", "16", "32"];
+                    chosen(it) => { root.menu-action("Bin", it); }
+                }
+                MenuBarItem {
+                    label: "Zoom";
+                    items: ["Zoom In", "Zoom Out", "Fit", "Reset", "—",
+                            "1×", "2×", "4×", "8×", "16×"];
+                    chosen(it) => { root.menu-action("Zoom", it); }
+                }
+                MenuBarItem {
+                    label: "Scale";
+                    items: ["linear", "log", "sqrt", "squared", "asinh", "sinh", "—",
+                            "minmax", "zscale"];
+                    chosen(it) => { root.menu-action("Scale", it); }
+                }
+                MenuBarItem {
+                    label: "Color";
+                    items: ["grey", "red", "green", "blue", "—",
+                            "a", "b", "bb", "heat", "cool", "rainbow", "sls", "hsv"];
+                    chosen(it) => { root.menu-action("Color", it); }
+                }
+                MenuBarItem {
+                    label: "Region";
+                    items: ["New", "Load…", "Save…", "—", "Info"];
+                    chosen(it) => { root.menu-action("Region", it); }
+                }
+                MenuBarItem {
+                    label: "WCS";
+                    items: ["FK5", "ICRS", "Galactic", "—", "Degrees", "Sexagesimal"];
+                    chosen(it) => { root.menu-action("WCS", it); }
+                }
+                MenuBarItem {
+                    label: "Analysis";
+                    items: ["Pixel Table…", "Histogram…", "Statistics…", "Contour Levels…"];
+                    chosen(it) => { root.menu-action("Analysis", it); }
+                }
+                MenuBarItem {
+                    label: "Catalog";
+                    items: ["Load…", "Clear", "—", "Info"];
+                    chosen(it) => { root.menu-action("Catalog", it); }
+                }
+                MenuBarItem {
+                    label: "Help";
+                    items: ["About ds9-rust"];
+                    chosen(it) => { root.menu-action("Help", it); }
+                }
+                Rectangle { horizontal-stretch: 1; }
+            }
+        }
+        Rectangle { height: 1px; background: Style.accent-dim; }  // teal accent rule
+
+        // ---------------- info row ----------------
+        Rectangle {
+            background: Style.bg-sunken;
+            height: Style.row-h-info;
+            HorizontalLayout {
+                spacing: 0px;
+                InfoCell { caption: "FILE";  value: root.info-filename; horizontal-stretch: 2; }
+                Rectangle { width: 1px; background: Style.border; }
+                InfoCell { caption: "OBJ";   value: root.info-object;   horizontal-stretch: 2; }
+                Rectangle { width: 1px; background: Style.border; }
+                InfoCell { caption: "POS";   value: root.info-coords;   horizontal-stretch: 1; }
+                Rectangle { width: 1px; background: Style.border; }
+                InfoCell { caption: "VAL";   value: root.info-value;    horizontal-stretch: 1; }
+                Rectangle { width: 1px; background: Style.border; }
+                InfoCell { caption: "WCS";   value: root.info-wcs;      horizontal-stretch: 1; }
+                Rectangle { width: 1px; background: Style.border; }
+                InfoCell {
+                    caption: "PIPE";
+                    value: root.active-stretch + " · " + root.active-limits + " · " + root.active-cmap;
+                    horizontal-stretch: 1;
+                }
+            }
+        }
+        Rectangle { height: 1px; background: Style.border; }
+
+        // ---------------- main row ----------------
+        HorizontalLayout {
+            spacing: 0px;
+            vertical-stretch: 1;
+
+            // colorbar column
+            VerticalLayout {
+                width: Style.colorbar-w;
+                padding: 4px;
+                spacing: 0px;
+                Colorbar {
+                    strip: root.colorbar-strip;
+                    caption: root.active-cmap;
+                    vertical-stretch: 1;
+                }
+            }
+
+            // canvas
+            canvas := Rectangle {
+                horizontal-stretch: 1;
+                clip: true;
+                background: Style.bg-canvas;
+                border-color: Style.border;
+                border-width: 1px;
+                changed width  => { root.canvas-w = self.width; }
+                changed height => { root.canvas-h = self.height; }
+
+                img := Image {
+                    source: root.fits-image;
+                    image-rendering: pixelated;
+                    x: root.view-pan-x;
+                    y: root.view-pan-y;
+                    width:  root.fits-width  * 1px * root.view-zoom;
+                    height: root.fits-height * 1px * root.view-zoom;
+                }
+
+                // region overlays — drawn in image-pixel space then scaled by view-zoom
+                for m in root.markers: Rectangle {
+                    x: root.view-pan-x + (m.cx - m.rx) * 1px * root.view-zoom;
+                    y: root.view-pan-y + (m.cy - m.ry) * 1px * root.view-zoom;
+                    width:  m.rx * 2px * root.view-zoom;
+                    height: m.ry * 2px * root.view-zoom;
+                    background: transparent;
+                    border-color: m.color;
+                    border-width: 1.5px;
+                    border-radius: m.kind == 0 ? min(self.width, self.height) / 2 : 0px;
+                }
+
+                ta := TouchArea {
+                    property <length> last-x;
+                    property <length> last-y;
+                    property <bool>   dragging;
+
+                    pointer-event(e) => {
+                        if (e.kind == PointerEventKind.down) {
+                            self.last-x = self.mouse-x;
+                            self.last-y = self.mouse-y;
+                            self.dragging = true;
+                        }
+                        if (e.kind == PointerEventKind.up) {
+                            self.dragging = false;
+                            // emit click to Rust (image-space)
+                            if (root.view-zoom > 0) {
+                                root.canvas-clicked(
+                                    (self.mouse-x - root.view-pan-x) / 1px / root.view-zoom,
+                                    (self.mouse-y - root.view-pan-y) / 1px / root.view-zoom);
+                            }
+                        }
+                    }
+                    moved => {
+                        // image-space cursor coords for the info row + magnifier
+                        if (root.view-zoom > 0) {
+                            root.cursor-image-x =
+                                (self.mouse-x - root.view-pan-x) / 1px / root.view-zoom;
+                            root.cursor-image-y =
+                                (self.mouse-y - root.view-pan-y) / 1px / root.view-zoom;
+                            root.canvas-mouse-move(root.cursor-image-x, root.cursor-image-y);
+                        }
+                        if (self.dragging) {
+                            root.view-pan-x += self.mouse-x - self.last-x;
+                            root.view-pan-y += self.mouse-y - self.last-y;
+                            self.last-x = self.mouse-x;
+                            self.last-y = self.mouse-y;
+                            root.view-changed();
+                        }
+                    }
+                    scroll-event(e) => {
+                        if (e.delta-y != 0) {
+                            root.set-zoom-anchored(
+                                max(0.02, min(64.0,
+                                    root.view-zoom * (e.delta-y > 0 ? 1.15 : 0.87))),
+                                self.mouse-x, self.mouse-y);
+                            root.view-changed();
+                            return accept;
+                        }
+                        return reject;
+                    }
+                }
+
+                // top-left readout — small, like DS9's overlay
+                Rectangle {
+                    x: 8px; y: 8px;
+                    width: ovl.preferred-width  + 12px;
+                    height: ovl.preferred-height + 6px;
+                    background: #000000a0;
+                    border-radius: 2px;
+                    border-width: 1px;
+                    border-color: Style.accent-dim;
+                    ovl := Text {
+                        x: 6px;
+                        y: (parent.height - self.preferred-height) / 2;
+                        text: "zoom " + round(root.view-zoom * 100) / 100
+                              + "×    " + root.fits-width + " × " + root.fits-height;
+                        color: Style.accent;
+                        font-size: 10px;
+                        font-family: Style.mono;
+                    }
+                }
+            }
+
+            // sidebar: panner + magnifier
+            VerticalLayout {
+                width: Style.sidebar-w;
+                padding: 4px;
+                spacing: 4px;
+                Panner {
+                    caption: "PANNER";
+                    height: 150px;
+                    source: root.fits-image;
+                    img-w: root.fits-width;
+                    img-h: root.fits-height;
+                    view-x: root.vp-x;
+                    view-y: root.vp-y;
+                    view-w: root.vp-w;
+                    view-h: root.vp-h;
+                    panned(ix, iy) => { root.recenter-view-on(ix, iy); }
+                }
+                Magnifier {
+                    caption: "MAGNIFIER";
+                    height: 150px;
+                    source: root.fits-image;
+                    img-w: root.fits-width;
+                    img-h: root.fits-height;
+                    cursor-x: root.cursor-image-x;
+                    cursor-y: root.cursor-image-y;
+                    mag: 8.0;
+                }
+                Rectangle { vertical-stretch: 1; }
+            }
+        }
+
+        Rectangle { height: 1px; background: Style.border; }
+
+        // ---------------- mode buttons ----------------
+        Rectangle {
+            background: Style.bg-panel;
+            height: Style.row-h-mode;
+            HorizontalLayout {
+                padding-left: 8px; padding-right: 8px; padding-top: 4px; padding-bottom: 4px;
+                spacing: 4px;
+                ModeButton { label: "edit";      active: root.active-mode == "edit";      clicked => { root.set-mode("edit"); } }
+                ModeButton { label: "crosshair"; active: root.active-mode == "crosshair"; clicked => { root.set-mode("crosshair"); } }
+                ModeButton { label: "colorbar";  active: root.active-mode == "colorbar";  clicked => { root.set-mode("colorbar"); } }
+                ModeButton { label: "pan";       active: root.active-mode == "pan";       clicked => { root.set-mode("pan"); } }
+                ModeButton { label: "zoom";      active: root.active-mode == "zoom";      clicked => { root.set-mode("zoom"); } }
+                ModeButton { label: "rotate";    active: root.active-mode == "rotate";    clicked => { root.set-mode("rotate"); } }
+                ModeButton { label: "crop";      active: root.active-mode == "crop";      clicked => { root.set-mode("crop"); } }
+                ModeButton { label: "catalog";   active: root.active-mode == "catalog";   clicked => { root.set-mode("catalog"); } }
+                ModeButton { label: "examine";   active: root.active-mode == "examine";   clicked => { root.set-mode("examine"); } }
+                ModeButton { label: "iexam";     active: root.active-mode == "iexam";     clicked => { root.set-mode("iexam"); } }
+                ModeButton { label: "3d";        active: root.active-mode == "3d";        clicked => { root.set-mode("3d"); } }
+                Rectangle { horizontal-stretch: 1; }
+                ModeButton { label: "Open File…"; clicked => { root.request-open-file(); } }
+            }
+        }
+
+        // ---------------- status bar ----------------
+        Rectangle {
+            background: Style.bg-sunken;
+            height: Style.row-h-status;
+            HorizontalLayout {
+                padding-left: 8px;
+                padding-right: 8px;
+                spacing: 8px;
+                Text {
+                    text: "▸";
+                    color: Style.accent;
+                    vertical-alignment: center;
+                    font-family: Style.mono;
+                    font-size: 11px;
+                }
+                Text {
+                    text: root.status-text;
+                    color: Style.text-dim;
+                    vertical-alignment: center;
+                    font-family: Style.mono;
+                    font-size: 11px;
+                    horizontal-stretch: 1;
+                }
+                Text {
+                    text: "ds9-rust 0.1";
+                    color: Style.text-dim;
+                    vertical-alignment: center;
+                    font-family: Style.mono;
+                    font-size: 11px;
+                }
+            }
+        }
+    }
+}

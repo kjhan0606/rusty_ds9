@@ -1,0 +1,8 @@
+[package]
+name = "ds9-catalog"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ds9-marker = { workspace = true }

@@ -1,0 +1,10 @@
+[package]
+name = "ds9-fits"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+fitsrs = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }

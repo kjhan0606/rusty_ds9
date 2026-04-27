@@ -1,0 +1,19 @@
+# Cargo build artifacts
+/target/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS clutter
+.DS_Store
+Thumbs.db
+
+# Local test fixtures
+/tmp/
+*.fits
+*.fits.fz
+*.png
+!docs/**/*.png

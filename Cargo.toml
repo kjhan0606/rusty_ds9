@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ds9-app",
+    "crates/ds9-fits",
+    "crates/ds9-image",
+    "crates/ds9-marker",
+    "crates/ds9-catalog",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.85"
+
+[workspace.dependencies]
+ds9-fits     = { path = "crates/ds9-fits" }
+ds9-image    = { path = "crates/ds9-image" }
+ds9-marker   = { path = "crates/ds9-marker" }
+ds9-catalog  = { path = "crates/ds9-catalog" }
+
+slint        = "1.16"
+slint-build  = "1.16"
+fitsrs       = "0.4"
+anyhow       = "1"
+thiserror    = "2"
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+# Local patch fixing F32 precision loss in fitsrs tile-compressed unquantize
+# (DES `.fz` files store ZZERO ~ 2.7e8, where f32 step is ±32 — wider than
+# the underlying noise — so the dithered round-trip needs f64 arithmetic).
+[patch.crates-io]
+fitsrs = { path = "crates/vendor/fitsrs" }

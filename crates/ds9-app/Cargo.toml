@@ -1,0 +1,21 @@
+[package]
+name = "ds9-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ds9"
+path = "src/main.rs"
+
+[dependencies]
+slint        = { workspace = true }
+ds9-fits     = { workspace = true }
+ds9-image    = { workspace = true }
+ds9-marker   = { workspace = true }
+ds9-catalog  = { workspace = true }
+anyhow       = { workspace = true }
+rfd          = "0.15"
+
+[build-dependencies]
+slint-build  = { workspace = true }
