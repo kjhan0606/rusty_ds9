@@ -82,6 +82,51 @@ impl Wcs {
         ra_d = ra_d.rem_euclid(360.0);
         (ra_d, dec_d)
     }
+
+    /// Inverse gnomonic projection: convert world (RA, Dec) in degrees to a
+    /// 1-based FITS pixel position. Returns `None` if the CD matrix is singular
+    /// (or the point is on the opposite hemisphere with no valid intermediate).
+    pub fn world_to_pix(&self, ra_deg: f64, dec_deg: f64) -> Option<(f64, f64)> {
+        let ra   = ra_deg.to_radians();
+        let dec  = dec_deg.to_radians();
+        let ra0  = self.crval1.to_radians();
+        let dec0 = self.crval2.to_radians();
+        let cos_dec = dec.cos();
+        let sin_dec = dec.sin();
+        let cos_dec0 = dec0.cos();
+        let sin_dec0 = dec0.sin();
+        let dra = ra - ra0;
+        // standard TAN forward projection
+        let denom = sin_dec0 * sin_dec + cos_dec0 * cos_dec * dra.cos();
+        if denom <= 0.0 { return None; }
+        let xi  = (cos_dec * dra.sin() / denom).to_degrees();
+        let eta = ((cos_dec0 * sin_dec - sin_dec0 * cos_dec * dra.cos()) / denom).to_degrees();
+        // invert the CD matrix
+        let det = self.cd11 * self.cd22 - self.cd12 * self.cd21;
+        if det.abs() < 1e-30 { return None; }
+        let inv = 1.0 / det;
+        let dx =  inv * ( self.cd22 * xi - self.cd12 * eta);
+        let dy =  inv * (-self.cd21 * xi + self.cd11 * eta);
+        Some((dx + self.crpix1, dy + self.crpix2))
+    }
+}
+
+/// Approximate galactic-to-ICRS rotation (J2000 epoch, IAU 1958 pole).
+/// Good to a few arcseconds — enough for region overlays.
+pub fn galactic_to_icrs(l_deg: f64, b_deg: f64) -> (f64, f64) {
+    // J2000 NGP and l-of-NCP per Liu et al. 2011 / IAU 1958
+    let ngp_ra  = 192.859508_f64.to_radians();
+    let ngp_dec =  27.128336_f64.to_radians();
+    let lncp    = 122.932000_f64.to_radians();
+    let l = l_deg.to_radians();
+    let b = b_deg.to_radians();
+    let sin_dec = b.sin() * ngp_dec.sin() + b.cos() * ngp_dec.cos() * (lncp - l).cos();
+    let dec = sin_dec.asin();
+    let sin_ra_off = b.cos() * (lncp - l).sin() / dec.cos();
+    let cos_ra_off = (b.sin() - ngp_dec.sin() * sin_dec) / (ngp_dec.cos() * dec.cos());
+    let ra_off = sin_ra_off.atan2(cos_ra_off);
+    let ra = (ngp_ra + ra_off).rem_euclid(std::f64::consts::TAU);
+    (ra.to_degrees(), dec.to_degrees())
 }
 
 /// Format (ra_deg, dec_deg) as DS9-style sexagesimal: `12:34:56.78  +12:34:56.7`.

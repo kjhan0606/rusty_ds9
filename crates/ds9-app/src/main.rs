@@ -38,6 +38,10 @@ struct Frame {
     view_zoom: f32,
     view_pan_x: f32,
     view_pan_y: f32,
+    /// Gaussian-smooth kernel σ in pixels (0 = off).
+    smooth_sigma: f32,
+    /// Block-bin factor (1 = off, 2/4/8/16/32 chunkify).
+    bin_factor: u32,
 }
 
 impl Frame {
@@ -56,6 +60,8 @@ impl Frame {
             view_zoom: fit_zoom(w, h),
             view_pan_x: 0.0,
             view_pan_y: 0.0,
+            smooth_sigma: 0.0,
+            bin_factor: 1,
         }
     }
 
@@ -118,11 +124,30 @@ impl State {
 // ---------------------------------------------------------------- render --
 
 fn render_image(f: &Frame) -> Image {
-    let limits = f.limits();
-    let rgba = ds9_image::render_rgba_flipped(&f.fits, limits, f.stretch, f.cmap);
+    let rgba = render_rgba_for_frame(f);
     let mut buf = SharedPixelBuffer::<Rgba8Pixel>::new(f.fits.width as u32, f.fits.height as u32);
     buf.make_mut_bytes().copy_from_slice(&rgba);
     Image::from_rgba8(buf)
+}
+
+/// Apply per-frame bin/smooth filters before stretching, returning the raw
+/// flipped RGBA bytes. Caller wraps these into an Image / PNG / etc.
+fn render_rgba_for_frame(f: &Frame) -> Vec<u8> {
+    let mut owned: Option<FitsImage> = None;
+    if f.bin_factor > 1 {
+        owned = Some(ds9_image::bin_average(&f.fits, f.bin_factor));
+    }
+    if f.smooth_sigma > 0.0 {
+        let src = owned.as_ref().unwrap_or(&f.fits);
+        owned = Some(ds9_image::smooth_gaussian(src, f.smooth_sigma));
+    }
+    let img: &FitsImage = owned.as_ref().unwrap_or(&f.fits);
+    let limits = match f.limits_mode {
+        LimitsMode::Zscale => Limits::zscale(img),
+        LimitsMode::MinMax => Limits::minmax(img),
+        LimitsMode::User { low, high } => Limits { low, high },
+    };
+    ds9_image::render_rgba_flipped(img, limits, f.stretch, f.cmap)
 }
 
 fn make_colorbar_strip(cmap: Colormap) -> Image {
@@ -582,15 +607,24 @@ fn region_load(window: &MainWindow, st: &mut State) {
         return;
     };
     match std::fs::read_to_string(&p) {
-        Ok(text) => match ds9_marker::parse_reg(&text) {
-            Ok(ms) => {
-                let n = ms.len();
-                f.markers = ms;
-                f.selected_marker = None;
-                window.set_status_text(format!("loaded {n} regions from {}", p.display()).into());
-                refresh_view(window, st);
+        Ok(text) => {
+            let parsed = match f.fits.wcs.as_ref() {
+                Some(w) => ds9_marker::parse_reg_with_wcs(&text, w),
+                None    => ds9_marker::parse_reg(&text),
+            };
+            match parsed {
+                Ok(ms) => {
+                    let n = ms.len();
+                    let wcs_note = if f.fits.wcs.is_some() { "" } else { "  [no WCS — sky regions assumed image]" };
+                    f.markers = ms;
+                    f.selected_marker = None;
+                    window.set_status_text(format!(
+                        "loaded {n} regions from {}{wcs_note}", p.display()
+                    ).into());
+                    refresh_view(window, st);
+                }
+                Err(e) => window.set_status_text(format!("region parse error: {e}").into()),
             }
-            Err(e) => window.set_status_text(format!("region parse error: {e}").into()),
         }
         Err(e) => window.set_status_text(format!("region read error: {e}").into()),
     }
@@ -656,12 +690,173 @@ fn region_save(window: &MainWindow, st: &State) {
     }
 }
 
+// ---------------------------------------------------------------- composite --
+
+/// Render the first three frames as the R / G / B channels of a single image.
+/// Returns `None` if their dimensions don't match.
+fn build_rgb_composite(frames: &[Frame]) -> Option<(Image, usize, usize)> {
+    let f0 = &frames[0];
+    let (w, h) = (f0.fits.width, f0.fits.height);
+    if frames.iter().any(|f| f.fits.width != w || f.fits.height != h) {
+        return None;
+    }
+    let render = |f: &Frame| -> Vec<u8> {
+        let lim = f.limits();
+        ds9_image::render_rgba_flipped(&f.fits, lim, f.stretch, Colormap::Grey)
+    };
+    let r = render(&frames[0]);
+    let g = render(&frames[1]);
+    let b = render(&frames[2]);
+    let mut out = vec![0u8; w * h * 4];
+    for i in 0..(w * h) {
+        let off = i * 4;
+        out[off]     = r[off];           // red channel from frame 0 luminance
+        out[off + 1] = g[off + 1].max(g[off]);
+        out[off + 2] = b[off + 2].max(b[off]);
+        out[off + 3] = 255;
+    }
+    let mut buf = SharedPixelBuffer::<Rgba8Pixel>::new(w as u32, h as u32);
+    buf.make_mut_bytes().copy_from_slice(&out);
+    Some((Image::from_rgba8(buf), w, h))
+}
+
+// ---------------------------------------------------------------- export --
+
+/// Save the active frame's rendered RGBA as a PNG.
+fn save_image_png(window: &MainWindow, st: &State) {
+    let Some(f) = st.active_frame() else {
+        window.set_status_text("save image: no active frame".into()); return;
+    };
+    let chosen: Option<PathBuf> = rfd::FileDialog::new()
+        .set_title("Save image as PNG")
+        .set_file_name(format!("{}.png",
+            f.name.trim_end_matches(".fits").trim_end_matches(".fit")))
+        .add_filter("PNG", &["png"])
+        .save_file();
+    let Some(p) = chosen else { return };
+    let rgba = render_rgba_for_frame(f);
+    let w = f.fits.width as u32;
+    let h = f.fits.height as u32;
+    let file = match std::fs::File::create(&p) {
+        Ok(f) => f,
+        Err(e) => { window.set_status_text(format!("save image: {e}").into()); return; }
+    };
+    let bw = std::io::BufWriter::new(file);
+    let mut enc = png::Encoder::new(bw, w, h);
+    enc.set_color(png::ColorType::Rgba);
+    enc.set_depth(png::BitDepth::Eight);
+    match enc.write_header().and_then(|mut wh| wh.write_image_data(&rgba)) {
+        Ok(()) => window.set_status_text(format!("wrote {} ({}×{})", p.display(), w, h).into()),
+        Err(e) => window.set_status_text(format!("save image: {e}").into()),
+    }
+}
+
+/// Save the active frame's data as a minimal FITS (BITPIX=-32, NAXIS=2). The
+/// header preserves CRPIX/CRVAL/CD if present so the saved file is still WCS-
+/// usable in DS9 / ds9-rust.
+fn save_image_fits(window: &MainWindow, st: &State) {
+    let Some(f) = st.active_frame() else {
+        window.set_status_text("save fits: no active frame".into()); return;
+    };
+    let chosen: Option<PathBuf> = rfd::FileDialog::new()
+        .set_title("Save image as FITS")
+        .set_file_name("image.fits")
+        .add_filter("FITS", &["fits", "fit"])
+        .save_file();
+    let Some(p) = chosen else { return };
+    match write_basic_fits(&p, &f.fits) {
+        Ok(()) => window.set_status_text(format!("wrote {}", p.display()).into()),
+        Err(e) => window.set_status_text(format!("save fits: {e}").into()),
+    }
+}
+
+fn write_basic_fits(path: &Path, img: &FitsImage) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut hdr: Vec<String> = Vec::new();
+    let card = |k: &str, v: &str| format!("{:<8}= {:<70}", k, v);
+    hdr.push(card("SIMPLE",  "T"));
+    hdr.push(card("BITPIX",  "-32"));
+    hdr.push(card("NAXIS",   "2"));
+    hdr.push(card("NAXIS1",  &img.width.to_string()));
+    hdr.push(card("NAXIS2",  &img.height.to_string()));
+    hdr.push(card("BSCALE",  "1.0"));
+    hdr.push(card("BZERO",   "0.0"));
+    if let Some(w) = &img.wcs {
+        hdr.push(card("CTYPE1",  &format!("'{:<8}'", w.ctype1)));
+        hdr.push(card("CTYPE2",  &format!("'{:<8}'", w.ctype2)));
+        hdr.push(card("CRPIX1",  &format!("{:.10E}", w.crpix1)));
+        hdr.push(card("CRPIX2",  &format!("{:.10E}", w.crpix2)));
+        hdr.push(card("CRVAL1",  &format!("{:.10E}", w.crval1)));
+        hdr.push(card("CRVAL2",  &format!("{:.10E}", w.crval2)));
+        hdr.push(card("CD1_1",   &format!("{:.10E}", w.cd11)));
+        hdr.push(card("CD1_2",   &format!("{:.10E}", w.cd12)));
+        hdr.push(card("CD2_1",   &format!("{:.10E}", w.cd21)));
+        hdr.push(card("CD2_2",   &format!("{:.10E}", w.cd22)));
+        hdr.push(card("RADESYS", &format!("'{:<8}'", w.radesys)));
+    }
+    hdr.push("END".to_string() + &" ".repeat(77));
+
+    let mut bytes: Vec<u8> = Vec::new();
+    for c in &hdr {
+        let mut s = c.as_bytes().to_vec();
+        s.resize(80, b' ');
+        bytes.extend_from_slice(&s);
+    }
+    while bytes.len() % 2880 != 0 { bytes.push(b' '); }
+    // FITS data is big-endian, written top-to-bottom in *FITS* orientation
+    // (row 0 = bottom). Our in-memory data has row 0 = top after `pix_to_world`
+    // conventions we maintain — but since FITS storage is row-major bottom-up
+    // and we already feed the renderer with `(h - 1 - y)`, the in-memory order
+    // matches FITS-on-disk. Just stream `f32 BE`.
+    for &v in &img.data {
+        bytes.extend_from_slice(&v.to_be_bytes());
+    }
+    let pad = (2880 - bytes.len() % 2880) % 2880;
+    bytes.extend(std::iter::repeat(0u8).take(pad));
+    let mut f = std::fs::File::create(path)?;
+    f.write_all(&bytes)?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------- menus --
 
 fn handle_menu(window: &MainWindow, st: &mut State, menu: &str, item: &str) {
     match (menu, item) {
         // File
         ("File", "Open…") => window.invoke_request_open_file(),
+        ("File", "Save Image…") => save_image_png(window, st),
+        ("File", "Save FITS…")  => save_image_fits(window, st),
+        ("File", "Print…") => {
+            // Spawn a print pipeline by saving a PNG to a temp path and
+            // shelling out to `lpr`. If lpr isn't on PATH, fall back to
+            // notifying the user where the PNG ended up.
+            let Some(f) = st.active_frame() else {
+                window.set_status_text("print: no active frame".into()); return;
+            };
+            let tmp = std::env::temp_dir().join(format!("ds9-rust-print-{}.png", std::process::id()));
+            let rgba = render_rgba_for_frame(f);
+            let (w_, h_) = (f.fits.width as u32, f.fits.height as u32);
+            let res = (|| -> std::io::Result<()> {
+                let file = std::fs::File::create(&tmp)?;
+                let bw = std::io::BufWriter::new(file);
+                let mut enc = png::Encoder::new(bw, w_, h_);
+                enc.set_color(png::ColorType::Rgba);
+                enc.set_depth(png::BitDepth::Eight);
+                let mut wh = enc.write_header().map_err(|e| std::io::Error::other(e.to_string()))?;
+                wh.write_image_data(&rgba).map_err(|e| std::io::Error::other(e.to_string()))
+            })();
+            match res {
+                Ok(()) => {
+                    let printed = std::process::Command::new("lpr").arg(&tmp).status();
+                    let msg = match printed {
+                        Ok(s) if s.success() => format!("sent to lpr  ({})", tmp.display()),
+                        _ => format!("saved {} (lpr unavailable)", tmp.display()),
+                    };
+                    window.set_status_text(msg.into());
+                }
+                Err(e) => window.set_status_text(format!("print: {e}").into()),
+            }
+        }
         ("File", "Quit")  => { let _ = slint::quit_event_loop(); }
 
         // Frame
@@ -696,6 +891,50 @@ fn handle_menu(window: &MainWindow, st: &mut State, menu: &str, item: &str) {
                 switch_frame(window, st, (st.active + n - 1) % n);
             }
         }
+        ("Frame", "Match…") => {
+            let Some(active) = st.active_frame() else {
+                window.set_status_text("match: no active frame".into()); return;
+            };
+            let zoom = active.view_zoom;
+            let pan_x = active.view_pan_x;
+            let pan_y = active.view_pan_y;
+            let active_idx = st.active;
+            let n = st.frames.len();
+            for (i, fr) in st.frames.iter_mut().enumerate() {
+                if i == active_idx { continue; }
+                fr.view_zoom = zoom;
+                fr.view_pan_x = pan_x;
+                fr.view_pan_y = pan_y;
+            }
+            window.set_status_text(format!("matched view of {} frames to active", n).into());
+        }
+        ("Frame", "Blink") => {
+            let next = !window.get_blink_active();
+            window.set_blink_active(next);
+            window.set_status_text(
+                if next { "blink: on (cycling every 500 ms)".into() }
+                else    { "blink: off".into() }
+            );
+        }
+        ("Frame", "RGB Composite") => {
+            if st.frames.len() < 3 {
+                window.set_status_text("RGB: need at least 3 frames loaded".into());
+            } else {
+                match build_rgb_composite(&st.frames[0..3]) {
+                    Some((img, w, h)) => {
+                        window.set_fits_image(img);
+                        window.set_fits_width(w as i32);
+                        window.set_fits_height(h as i32);
+                        window.set_status_text(format!(
+                            "RGB composite from frames 1-3 ({w}×{h})"
+                        ).into());
+                    }
+                    None => window.set_status_text(
+                        "RGB: frames 1-3 must share the same dimensions".into()
+                    ),
+                }
+            }
+        }
 
         // Scale — stretch / limits live on the active frame
         ("Scale", "linear")  => { if let Some(f) = st.active_frame_mut() { f.stretch = Stretch::Linear;  } refresh_view(window, st); }
@@ -706,6 +945,15 @@ fn handle_menu(window: &MainWindow, st: &mut State, menu: &str, item: &str) {
         ("Scale", "sinh")    => { if let Some(f) = st.active_frame_mut() { f.stretch = Stretch::Sinh;    } refresh_view(window, st); }
         ("Scale", "minmax")  => { if let Some(f) = st.active_frame_mut() { f.limits_mode = LimitsMode::MinMax; } refresh_view(window, st); }
         ("Scale", "zscale")  => { if let Some(f) = st.active_frame_mut() { f.limits_mode = LimitsMode::Zscale; } refresh_view(window, st); }
+
+        // Bin
+        ("Bin", n) => {
+            if let Ok(factor) = n.parse::<u32>() {
+                if let Some(f) = st.active_frame_mut() { f.bin_factor = factor.max(1); }
+                refresh_view(window, st);
+                window.set_status_text(format!("bin: {n}×{n}").into());
+            }
+        }
 
         // Color
         ("Color", name) => {
@@ -771,6 +1019,31 @@ fn handle_menu(window: &MainWindow, st: &mut State, menu: &str, item: &str) {
                 None => "no catalog loaded".to_string(),
             };
             window.set_status_text(msg.into());
+        }
+
+        // Analysis — smoothing
+        ("Analysis", "Smooth (cycle)") => {
+            if let Some(f) = st.active_frame_mut() {
+                // 0 → 2 → 4 → 8 → 0
+                f.smooth_sigma = match f.smooth_sigma {
+                    s if s <= 0.0 => 2.0,
+                    s if s < 3.0  => 4.0,
+                    s if s < 6.0  => 8.0,
+                    _             => 0.0,
+                };
+                let label = if f.smooth_sigma <= 0.0 {
+                    "off".to_string()
+                } else {
+                    format!("σ = {:.0}px", f.smooth_sigma)
+                };
+                window.set_status_text(format!("smooth: {label}").into());
+                refresh_view(window, st);
+            }
+        }
+        ("Analysis", "Smooth Off") => {
+            if let Some(f) = st.active_frame_mut() { f.smooth_sigma = 0.0; }
+            window.set_status_text("smooth: off".into());
+            refresh_view(window, st);
         }
 
         // Analysis
@@ -874,6 +1147,162 @@ fn handle_menu(window: &MainWindow, st: &mut State, menu: &str, item: &str) {
             window.set_status_text(format!("{menu} ▸ {item} — not implemented yet").into());
         }
     }
+}
+
+// ---------------------------------------------------------------- IPC --
+
+/// Dispatch a single line of the IPC text protocol. Runs on the UI thread.
+/// Returns a response string (status / error / value) for the client.
+fn dispatch_ipc(window: &MainWindow, st: &mut State, line: &str) -> String {
+    let line = line.trim();
+    if line.is_empty() { return String::new(); }
+    let toks: Vec<&str> = line.splitn(3, ' ').collect();
+    match toks.as_slice() {
+        ["quit"] => { let _ = slint::quit_event_loop(); "ok".into() }
+        ["frame", "next"]      => { handle_menu(window, st, "Frame", "Next"); "ok".into() }
+        ["frame", "previous"]  => { handle_menu(window, st, "Frame", "Previous"); "ok".into() }
+        ["frame", n] => {
+            if let Ok(idx) = n.parse::<usize>() {
+                if idx >= 1 { switch_frame(window, st, idx - 1); }
+            }
+            "ok".into()
+        }
+        ["scale", s]            => { handle_menu(window, st, "Scale", s); "ok".into() }
+        ["cmap", c]             => { handle_menu(window, st, "Color", c); "ok".into() }
+        ["bin", n]              => { handle_menu(window, st, "Bin", n); "ok".into() }
+        ["zoom", "in"]          => { handle_menu(window, st, "Zoom", "Zoom In"); "ok".into() }
+        ["zoom", "out"]         => { handle_menu(window, st, "Zoom", "Zoom Out"); "ok".into() }
+        ["zoom", "fit"]         => { handle_menu(window, st, "Zoom", "Fit"); "ok".into() }
+        ["zoom", n]             => {
+            if let Ok(z) = n.parse::<f32>() { window.set_view_zoom(z.clamp(0.02, 64.0)); }
+            "ok".into()
+        }
+        ["region", "load", path]  => { region_load_path(window, st, Path::new(path)); "ok".into() }
+        ["region", "save", path]  => {
+            if let Some(f) = st.active_frame() {
+                match ds9_marker::write_reg(path, &f.markers) {
+                    Ok(()) => format!("ok {} regions", f.markers.len()),
+                    Err(e) => format!("err {e}"),
+                }
+            } else { "err no active frame".into() }
+        }
+        ["file", "open", path]    => { load_into(window, st, Path::new(path)); "ok".into() }
+        ["save", "png", path]     => {
+            let Some(f) = st.active_frame() else { return "err no frame".into() };
+            let rgba = render_rgba_for_frame(f);
+            let (w_, h_) = (f.fits.width as u32, f.fits.height as u32);
+            let res = (|| -> std::io::Result<()> {
+                let file = std::fs::File::create(path)?;
+                let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w_, h_);
+                enc.set_color(png::ColorType::Rgba);
+                enc.set_depth(png::BitDepth::Eight);
+                let mut wh = enc.write_header().map_err(|e| std::io::Error::other(e.to_string()))?;
+                wh.write_image_data(&rgba).map_err(|e| std::io::Error::other(e.to_string()))
+            })();
+            match res { Ok(()) => "ok".into(), Err(e) => format!("err {e}") }
+        }
+        ["save", "fits", path]    => {
+            let Some(f) = st.active_frame() else { return "err no frame".into() };
+            match write_basic_fits(Path::new(path), &f.fits) {
+                Ok(()) => "ok".into(), Err(e) => format!("err {e}"),
+            }
+        }
+        ["value"] => {
+            let cx = window.get_cursor_image_x() as i32;
+            let cy = window.get_cursor_image_y() as i32;
+            if let Some(f) = st.active_frame() {
+                let img = &f.fits;
+                if cx >= 0 && cy >= 0 && (cx as usize) < img.width && (cy as usize) < img.height {
+                    let v = img.data[cy as usize * img.width + cx as usize];
+                    format!("ok {v}")
+                } else { "err out of bounds".into() }
+            } else { "err no frame".into() }
+        }
+        ["help"] => "commands: quit | frame next|previous|N | scale S | cmap C | bin N | zoom in|out|fit|N | region load|save P | file open P | save png|fits P | value | help".into(),
+        _ => format!("err unknown: {line}"),
+    }
+}
+
+/// Helper used by both region_load (via dialog) and dispatch_ipc.
+fn region_load_path(window: &MainWindow, st: &mut State, p: &Path) {
+    let Some(f) = st.active_frame_mut() else {
+        window.set_status_text("region load: no active frame".into()); return;
+    };
+    let text = match std::fs::read_to_string(p) {
+        Ok(t) => t,
+        Err(e) => { window.set_status_text(format!("region load: {e}").into()); return; }
+    };
+    let parsed = match f.fits.wcs.as_ref() {
+        Some(w) => ds9_marker::parse_reg_with_wcs(&text, w),
+        None    => ds9_marker::parse_reg(&text),
+    };
+    match parsed {
+        Ok(ms) => {
+            let n = ms.len();
+            f.markers = ms; f.selected_marker = None;
+            window.set_status_text(format!("loaded {n} regions from {}", p.display()).into());
+            refresh_view(window, st);
+        }
+        Err(e) => window.set_status_text(format!("region parse error: {e}").into()),
+    }
+}
+
+/// Spawn a thread that listens on a Unix-domain socket for line-based IPC
+/// commands. Returns the path so callers can advertise it.
+fn start_ipc_server(weak: slint::Weak<MainWindow>, state: Rc<RefCell<State>>) -> Option<PathBuf> {
+    use std::os::unix::net::UnixListener;
+    use std::io::{BufRead, BufReader, Write};
+
+    let dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let user = std::env::var("USER").unwrap_or_else(|_| "user".to_string());
+    let sock = dir.join(format!("ds9-rust-{user}.sock"));
+    let _ = std::fs::remove_file(&sock);
+    let listener = match UnixListener::bind(&sock) {
+        Ok(l) => l,
+        Err(e) => { eprintln!("ds9-rust IPC: bind {} failed: {e}", sock.display()); return None; }
+    };
+
+    // Channel: IPC thread → UI thread
+    let _state = state;  // keep alive in closure
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let weak = weak.clone();
+            std::thread::spawn(move || {
+                let read = match stream.try_clone() { Ok(s) => s, Err(_) => return };
+                let mut reader = BufReader::new(read);
+                let mut line = String::new();
+                while reader.read_line(&mut line).map(|n| n > 0).unwrap_or(false) {
+                    let cmd = line.trim().to_string();
+                    line.clear();
+                    if cmd.is_empty() { continue; }
+                    let weak = weak.clone();
+                    let (tx, rx) = std::sync::mpsc::channel::<String>();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        let resp = if let Some(w) = weak.upgrade() {
+                            STATE_FOR_IPC.with(|c| {
+                                if let Some(st) = c.borrow().as_ref() {
+                                    dispatch_ipc(&w, &mut st.borrow_mut(), &cmd)
+                                } else { "err state unavailable".into() }
+                            })
+                        } else { "err window gone".into() };
+                        let _ = tx.send(resp);
+                    });
+                    let resp = rx.recv().unwrap_or_else(|_| "err no response".into());
+                    let _ = writeln!(stream, "{resp}");
+                }
+            });
+        }
+    });
+    Some(sock)
+}
+
+thread_local! {
+    /// Bridge so the IPC dispatch closure (which only captures Send things)
+    /// can reach the shared State without smuggling a !Send Rc across threads.
+    static STATE_FOR_IPC: RefCell<Option<Rc<RefCell<State>>>> = const { RefCell::new(None) };
 }
 
 // ---------------------------------------------------------------- main --
@@ -1129,6 +1558,33 @@ fn main() -> Result<()> {
             let Some(w) = weak.upgrade() else { return };
             handle_menu(&w, &mut state.borrow_mut(), &menu, &item);
         });
+    }
+
+    // ---- blink timer: while blink-active, advance Frame Next every 500ms ----
+    let blink_timer = slint::Timer::default();
+    {
+        let weak = win.as_weak();
+        let state = Rc::clone(&state);
+        blink_timer.start(
+            slint::TimerMode::Repeated,
+            std::time::Duration::from_millis(500),
+            move || {
+                let Some(w) = weak.upgrade() else { return };
+                if !w.get_blink_active() { return; }
+                let mut s = state.borrow_mut();
+                if s.frames.len() < 2 { return; }
+                let n = s.frames.len();
+                let target = (s.active + 1) % n;
+                switch_frame(&w, &mut s, target);
+            },
+        );
+    }
+
+    // ---- IPC server (Unix-domain socket) ----
+    STATE_FOR_IPC.with(|c| { *c.borrow_mut() = Some(Rc::clone(&state)); });
+    if let Some(p) = start_ipc_server(win.as_weak(), Rc::clone(&state)) {
+        eprintln!("ds9-rust IPC listening on {}", p.display());
+        win.set_status_text(format!("ready  (ipc: {})", p.display()).into());
     }
 
     win.run()?;

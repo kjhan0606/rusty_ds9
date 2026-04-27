@@ -16,6 +16,7 @@ ds9-marker   = { workspace = true }
 ds9-catalog  = { workspace = true }
 anyhow       = { workspace = true }
 rfd          = "0.15"
+png          = "0.17"
 
 [build-dependencies]
 slint-build  = { workspace = true }

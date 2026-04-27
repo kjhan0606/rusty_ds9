@@ -474,6 +474,9 @@ export component MainWindow inherits Window {
     //      marker was hit (so the canvas suppresses view-pan and click-drop) ----
     in-out property <bool> marker-drag-active: false;
 
+    // ---- blink mode toggle (Rust drives a 500-ms timer that calls Frame Next while on) ----
+    in-out property <bool> blink-active: false;
+
     // ---- main canvas viewport (image-pixel coords) — derived from the
     //      canvas Rectangle's actual size, populated below ----
     in-out property <length> canvas-w: 800px;
@@ -520,7 +523,7 @@ export component MainWindow inherits Window {
                 spacing: 0px;
                 MenuBarItem {
                     label: "File";
-                    items: ["Open…", "Save Image…", "—", "Print…", "—", "Quit"];
+                    items: ["Open…", "Save Image…", "Save FITS…", "—", "Print…", "—", "Quit"];
                     chosen(it) => { root.menu-action("File", it); }
                 }
                 MenuBarItem {
@@ -535,7 +538,8 @@ export component MainWindow inherits Window {
                 }
                 MenuBarItem {
                     label: "Frame";
-                    items: ["New Frame", "Delete Frame", "—", "Next", "Previous", "—", "Match…"];
+                    items: ["New Frame", "Delete Frame", "—", "Next", "Previous", "—",
+                            "Match…", "Blink", "RGB Composite"];
                     chosen(it) => { root.menu-action("Frame", it); }
                 }
                 MenuBarItem {
@@ -573,7 +577,8 @@ export component MainWindow inherits Window {
                 }
                 MenuBarItem {
                     label: "Analysis";
-                    items: ["Pixel Table…", "Histogram…", "Statistics…", "Contour Levels…"];
+                    items: ["Pixel Table…", "Histogram…", "Statistics…", "Contour Levels…",
+                            "—", "Smooth (cycle)", "Smooth Off"];
                     chosen(it) => { root.menu-action("Analysis", it); }
                 }
                 MenuBarItem {

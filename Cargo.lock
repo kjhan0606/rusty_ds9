@@ -1180,6 +1180,7 @@ dependencies = [
  "ds9-fits",
  "ds9-image",
  "ds9-marker",
+ "png 0.17.16",
  "rfd",
  "slint",
  "slint-build",
@@ -1211,6 +1212,9 @@ dependencies = [
 [[package]]
 name = "ds9-marker"
 version = "0.1.0"
+dependencies = [
+ "ds9-fits",
+]
 
 [[package]]
 name = "dtor"

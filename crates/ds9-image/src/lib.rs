@@ -241,6 +241,125 @@ pub fn render_grayscale(img: &FitsImage, lim: Limits, stretch: Stretch) -> Vec<u
     out
 }
 
+// ---------------------------------------------------------------- filters --
+
+/// Separable gaussian blur with kernel radius ≈ 3σ. Returns a new FitsImage
+/// of the same dimensions; the original is left intact. NaN pixels are
+/// treated as missing (skipped from the convolution sum and the weight).
+pub fn smooth_gaussian(img: &FitsImage, sigma: f32) -> FitsImage {
+    if sigma <= 0.0 || !sigma.is_finite() {
+        return clone_image(img);
+    }
+    let r = (3.0 * sigma).ceil() as i32;
+    let mut kernel = Vec::with_capacity((2 * r + 1) as usize);
+    let inv_two_sigma2 = 1.0 / (2.0 * sigma * sigma);
+    for k in -r..=r {
+        kernel.push((-(k as f32).powi(2) * inv_two_sigma2).exp());
+    }
+    let w = img.width;
+    let h = img.height;
+
+    // horizontal pass
+    let mut tmp = vec![f32::NAN; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let (mut acc, mut wsum) = (0.0_f32, 0.0_f32);
+            for k in -r..=r {
+                let xi = x as i32 + k;
+                if xi < 0 || xi as usize >= w { continue; }
+                let v = img.data[y * w + xi as usize];
+                if !v.is_finite() { continue; }
+                let kw = kernel[(k + r) as usize];
+                acc += v * kw;
+                wsum += kw;
+            }
+            tmp[y * w + x] = if wsum > 0.0 { acc / wsum } else { f32::NAN };
+        }
+    }
+    // vertical pass
+    let mut out = vec![f32::NAN; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let (mut acc, mut wsum) = (0.0_f32, 0.0_f32);
+            for k in -r..=r {
+                let yi = y as i32 + k;
+                if yi < 0 || yi as usize >= h { continue; }
+                let v = tmp[yi as usize * w + x];
+                if !v.is_finite() { continue; }
+                let kw = kernel[(k + r) as usize];
+                acc += v * kw;
+                wsum += kw;
+            }
+            out[y * w + x] = if wsum > 0.0 { acc / wsum } else { f32::NAN };
+        }
+    }
+    let (min, max) = finite_minmax(&out);
+    FitsImage { width: w, height: h, data: out, min, max, wcs: img.wcs.clone() }
+}
+
+/// Block-average bin a factor `n` across both axes, then expand back so the
+/// returned image has the same size as the input (each NxN block holds the
+/// same averaged value). Visualization-only — the WCS / coords don't shift.
+pub fn bin_average(img: &FitsImage, n: u32) -> FitsImage {
+    if n <= 1 { return clone_image(img); }
+    let n = n as usize;
+    let w = img.width;
+    let h = img.height;
+    let mut out = vec![f32::NAN; w * h];
+    let by = (0..h).step_by(n);
+    for y0 in by {
+        let y1 = (y0 + n).min(h);
+        let bx = (0..w).step_by(n);
+        for x0 in bx {
+            let x1 = (x0 + n).min(w);
+            let (mut sum, mut count) = (0.0_f64, 0_usize);
+            for yy in y0..y1 {
+                let row = yy * w;
+                for xx in x0..x1 {
+                    let v = img.data[row + xx];
+                    if v.is_finite() {
+                        sum += v as f64;
+                        count += 1;
+                    }
+                }
+            }
+            let avg = if count > 0 { (sum / count as f64) as f32 } else { f32::NAN };
+            for yy in y0..y1 {
+                let row = yy * w;
+                for xx in x0..x1 {
+                    out[row + xx] = avg;
+                }
+            }
+        }
+    }
+    let (min, max) = finite_minmax(&out);
+    FitsImage { width: w, height: h, data: out, min, max, wcs: img.wcs.clone() }
+}
+
+fn clone_image(img: &FitsImage) -> FitsImage {
+    FitsImage {
+        width: img.width,
+        height: img.height,
+        data: img.data.clone(),
+        min: img.min,
+        max: img.max,
+        wcs: img.wcs.clone(),
+    }
+}
+
+fn finite_minmax(data: &[f32]) -> (f32, f32) {
+    let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+    for &v in data {
+        if v.is_finite() {
+            if v < lo { lo = v; }
+            if v > hi { hi = v; }
+        }
+    }
+    if !lo.is_finite() { lo = 0.0; }
+    if !hi.is_finite() { hi = 1.0; }
+    (lo, hi)
+}
+
 /// FITS pixel order is bottom-up; flip rows so the displayed image matches
 /// what DS9 / SAO show by default. Applies stretch + colormap LUT in one pass.
 pub fn render_rgba_flipped(
