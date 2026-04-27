@@ -8,12 +8,22 @@ import { ScrollView } from "std-widgets.slint";
 // Markers are rendered in canvas/image-pixel space (0-based, top-left, y-down).
 // Conversion from DS9's 1-based, bottom-up FITS coords happens in Rust.
 struct Mark {
-    kind: int,     // 0 = circle, 1 = box (axis-aligned)
-    cx: float,     // image-space pixel center
+    kind: int,        // 0 = circle, 1 = box (axis-aligned)
+    cx: float,        // image-space pixel center
     cy: float,
-    rx: float,     // half-extent in x
-    ry: float,     // half-extent in y
+    rx: float,        // half-extent in x
+    ry: float,        // half-extent in y
     color: color,
+    selected: bool,   // emphasised when the matching catalog row is selected
+}
+
+// One row of the catalog table panel. `id` is a short label (NUMBER or row
+// index), `mag` is preformatted ("—" if no magnitude column was found).
+struct CatRow {
+    id: string,
+    x: float,         // FITS image-pixel coords (1-based)
+    y: float,
+    mag: string,
 }
 
 global Style {
@@ -321,6 +331,92 @@ component Magnifier inherits Rectangle {
     }
 }
 
+/// Scrollable catalog table. Columns: id, x, y, mag. Click a row to ask the
+/// host to recenter the canvas on that source.
+component CatalogPanel inherits Rectangle {
+    in property <string> caption;
+    in property <[CatRow]> rows: [];
+    in property <int> selected: -1;
+    callback row-clicked(int);
+
+    background: Style.bg-sunken;
+    border-color: Style.border;
+    border-width: 1px;
+
+    property <length> row-h: 16px;
+
+    Text {
+        x: 6px; y: 4px;
+        text: root.caption + "  (" + root.rows.length + ")";
+        color: Style.text-dim;
+        font-size: 10px;
+        font-family: Style.mono;
+    }
+
+    // header
+    Rectangle {
+        x: 6px; y: 18px;
+        width: parent.width - 12px;
+        height: 14px;
+        background: Style.bg-panel;
+        HorizontalLayout {
+            padding-left: 4px; padding-right: 4px;
+            Text { text: "id";  color: Style.text-dim; font-size: 9px; font-family: Style.mono;
+                   horizontal-stretch: 1; vertical-alignment: center; }
+            Text { text: "x";   color: Style.text-dim; font-size: 9px; font-family: Style.mono;
+                   horizontal-stretch: 1; vertical-alignment: center; horizontal-alignment: right; }
+            Text { text: "y";   color: Style.text-dim; font-size: 9px; font-family: Style.mono;
+                   horizontal-stretch: 1; vertical-alignment: center; horizontal-alignment: right; }
+            Text { text: "mag"; color: Style.text-dim; font-size: 9px; font-family: Style.mono;
+                   horizontal-stretch: 1; vertical-alignment: center; horizontal-alignment: right; }
+        }
+    }
+
+    sv := ScrollView {
+        x: 6px; y: 34px;
+        width: parent.width - 12px;
+        height: parent.height - 38px;
+
+        // auto-scroll the selected row into view
+        changed viewport-y => { /* nothing — but binding required to permit assignment */ }
+
+        VerticalLayout {
+            spacing: 0px;
+            for r[i] in root.rows: Rectangle {
+                height: root.row-h;
+                background: i == root.selected
+                    ? Style.accent-dim
+                    : (rta.has-hover ? Style.bg-hover : transparent);
+                HorizontalLayout {
+                    padding-left: 4px; padding-right: 4px;
+                    Text { text: r.id; color: Style.text; font-size: 10px; font-family: Style.mono;
+                           horizontal-stretch: 1; vertical-alignment: center; }
+                    Text { text: round(r.x * 10) / 10; color: Style.text-dim;
+                           font-size: 10px; font-family: Style.mono;
+                           horizontal-stretch: 1; vertical-alignment: center; horizontal-alignment: right; }
+                    Text { text: round(r.y * 10) / 10; color: Style.text-dim;
+                           font-size: 10px; font-family: Style.mono;
+                           horizontal-stretch: 1; vertical-alignment: center; horizontal-alignment: right; }
+                    Text { text: r.mag; color: Style.text-dim;
+                           font-size: 10px; font-family: Style.mono;
+                           horizontal-stretch: 1; vertical-alignment: center; horizontal-alignment: right; }
+                }
+                rta := TouchArea {
+                    clicked => { root.row-clicked(i); }
+                }
+            }
+        }
+    }
+
+    // Slint exposes ScrollView.viewport-y as a length we can read/write.
+    // When the selected index changes from outside, reveal that row.
+    changed selected => {
+        if (root.selected >= 0) {
+            sv.viewport-y = -1px * root.selected * (root.row-h / 1px) + sv.height / 2 - root.row-h;
+        }
+    }
+}
+
 export component MainWindow inherits Window {
     title: "ds9-rust";
     background: Style.bg-deep;
@@ -348,7 +444,18 @@ export component MainWindow inherits Window {
     // ---- regions ----
     in-out property <[Mark]> markers: [];
 
+    // ---- catalog ----
+    in-out property <[CatRow]> catalog-rows: [];
+    in-out property <int>      catalog-selected: -1;
+
+    // ---- analysis overlays ----
+    in-out property <image> histogram-image;
+    in-out property <image> contour-image;
+    in-out property <bool>  histogram-visible: false;
+    in-out property <bool>  contour-visible:   false;
+
     // ---- info readouts ----
+    in-out property <string> info-frame:    "0/0";
     in-out property <string> info-filename: "—";
     in-out property <string> info-object:   "—";
     in-out property <string> info-coords:   "x: ——      y: ——";
@@ -363,6 +470,10 @@ export component MainWindow inherits Window {
     in-out property <float> cursor-image-x: 0;
     in-out property <float> cursor-image-y: 0;
 
+    // ---- region drag state — Rust flips this true during pointer-down when a
+    //      marker was hit (so the canvas suppresses view-pan and click-drop) ----
+    in-out property <bool> marker-drag-active: false;
+
     // ---- main canvas viewport (image-pixel coords) — derived from the
     //      canvas Rectangle's actual size, populated below ----
     in-out property <length> canvas-w: 800px;
@@ -376,11 +487,14 @@ export component MainWindow inherits Window {
     callback request-open-file();
     callback canvas-mouse-move(/*image-x*/ float, /*image-y*/ float);
     callback canvas-clicked(/*image-x*/ float, /*image-y*/ float);
+    callback canvas-pressed(/*image-x*/ float, /*image-y*/ float);
+    callback canvas-released();
     callback view-changed();
     callback set-mode(string);
     callback menu-action(/*menu*/ string, /*item*/ string);
+    callback catalog-row-activated(/*index*/ int);
 
-    function recenter-view-on(ix: float, iy: float) {
+    public function recenter-view-on(ix: float, iy: float) {
         // place image-pixel (ix,iy) at the centre of the canvas
         self.view-pan-x = self.canvas-w / 2 - ix * 1px * self.view-zoom;
         self.view-pan-y = self.canvas-h / 2 - iy * 1px * self.view-zoom;
@@ -449,7 +563,7 @@ export component MainWindow inherits Window {
                 }
                 MenuBarItem {
                     label: "Region";
-                    items: ["New", "Load…", "Save…", "—", "Info"];
+                    items: ["New", "Load…", "Save…", "—", "Delete Selected", "Delete All", "—", "Info"];
                     chosen(it) => { root.menu-action("Region", it); }
                 }
                 MenuBarItem {
@@ -483,6 +597,8 @@ export component MainWindow inherits Window {
             height: Style.row-h-info;
             HorizontalLayout {
                 spacing: 0px;
+                InfoCell { caption: "FRM";   value: root.info-frame;    horizontal-stretch: 0; }
+                Rectangle { width: 1px; background: Style.border; }
                 InfoCell { caption: "FILE";  value: root.info-filename; horizontal-stretch: 2; }
                 Rectangle { width: 1px; background: Style.border; }
                 InfoCell { caption: "OBJ";   value: root.info-object;   horizontal-stretch: 2; }
@@ -538,6 +654,17 @@ export component MainWindow inherits Window {
                     height: root.fits-height * 1px * root.view-zoom;
                 }
 
+                // contour overlay — same geometry as the main image so they
+                // align pixel-for-pixel
+                if root.contour-visible: Image {
+                    source: root.contour-image;
+                    image-rendering: pixelated;
+                    x: root.view-pan-x;
+                    y: root.view-pan-y;
+                    width:  root.fits-width  * 1px * root.view-zoom;
+                    height: root.fits-height * 1px * root.view-zoom;
+                }
+
                 // region overlays — drawn in image-pixel space then scaled by view-zoom
                 for m in root.markers: Rectangle {
                     x: root.view-pan-x + (m.cx - m.rx) * 1px * root.view-zoom;
@@ -545,8 +672,8 @@ export component MainWindow inherits Window {
                     width:  m.rx * 2px * root.view-zoom;
                     height: m.ry * 2px * root.view-zoom;
                     background: transparent;
-                    border-color: m.color;
-                    border-width: 1.5px;
+                    border-color: m.selected ? Style.accent : m.color;
+                    border-width: m.selected ? 2.5px : 1.5px;
                     border-radius: m.kind == 0 ? min(self.width, self.height) / 2 : 0px;
                 }
 
@@ -559,12 +686,22 @@ export component MainWindow inherits Window {
                         if (e.kind == PointerEventKind.down) {
                             self.last-x = self.mouse-x;
                             self.last-y = self.mouse-y;
-                            self.dragging = true;
+                            // Ask Rust whether this press hit a marker. Rust will
+                            // toggle marker-drag-active synchronously.
+                            if (root.view-zoom > 0) {
+                                root.canvas-pressed(
+                                    (self.mouse-x - root.view-pan-x) / 1px / root.view-zoom,
+                                    (self.mouse-y - root.view-pan-y) / 1px / root.view-zoom);
+                            }
+                            // Only enter view-pan drag if the press did NOT land on a marker.
+                            self.dragging = !root.marker-drag-active;
                         }
                         if (e.kind == PointerEventKind.up) {
                             self.dragging = false;
-                            // emit click to Rust (image-space)
-                            if (root.view-zoom > 0) {
+                            if (root.marker-drag-active) {
+                                root.canvas-released();
+                            } else if (root.view-zoom > 0) {
+                                // emit click to Rust (image-space)
                                 root.canvas-clicked(
                                     (self.mouse-x - root.view-pan-x) / 1px / root.view-zoom,
                                     (self.mouse-y - root.view-pan-y) / 1px / root.view-zoom);
@@ -620,6 +757,51 @@ export component MainWindow inherits Window {
                         font-family: Style.mono;
                     }
                 }
+
+                // floating histogram panel
+                if root.histogram-visible: Rectangle {
+                    x: 12px;
+                    y: parent.height - 250px;
+                    width: 380px;
+                    height: 230px;
+                    background: Style.bg-panel;
+                    border-color: Style.border-hi;
+                    border-width: 1px;
+                    border-radius: 3px;
+
+                    Text {
+                        x: 8px; y: 4px;
+                        text: "HISTOGRAM  (log counts)";
+                        color: Style.accent;
+                        font-size: 10px;
+                        font-family: Style.mono;
+                    }
+                    // close button
+                    Rectangle {
+                        x: parent.width - 22px; y: 3px;
+                        width: 18px; height: 18px;
+                        background: cta.has-hover ? Style.bg-hover : transparent;
+                        border-radius: 2px;
+                        Text {
+                            x: 4px; y: -1px;
+                            text: "×";
+                            color: Style.text;
+                            font-size: 14px;
+                            font-family: Style.mono;
+                        }
+                        cta := TouchArea {
+                            clicked => { root.histogram-visible = false; }
+                        }
+                    }
+                    Image {
+                        x: 8px; y: 24px;
+                        width:  parent.width  - 16px;
+                        height: parent.height - 32px;
+                        source: root.histogram-image;
+                        image-fit: fill;
+                        image-rendering: smooth;
+                    }
+                }
             }
 
             // sidebar: panner + magnifier
@@ -649,7 +831,13 @@ export component MainWindow inherits Window {
                     cursor-y: root.cursor-image-y;
                     mag: 8.0;
                 }
-                Rectangle { vertical-stretch: 1; }
+                CatalogPanel {
+                    caption: "CATALOG";
+                    rows: root.catalog-rows;
+                    selected: root.catalog-selected;
+                    vertical-stretch: 1;
+                    row-clicked(i) => { root.catalog-row-activated(i); }
+                }
             }
         }
 
