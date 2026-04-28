@@ -320,6 +320,135 @@ where
 
 // ------------------------------------------------------------------ load --
 
+/// One row of [`enumerate_hdus`] output: an HDU's index in the file plus its
+/// kind, EXTNAME (or "PRIMARY"/"XImage"/"XTable" if absent), and 2-D image
+/// dimensions when applicable.
+#[derive(Debug, Clone)]
+pub struct HduInfo {
+    /// 0-based HDU index in the file.
+    pub idx: usize,
+    /// Short label: "PRIMARY", "IMAGE", "TILE-COMPRESSED", "TABLE".
+    pub kind: &'static str,
+    /// EXTNAME header value, falling back to `kind` if missing.
+    pub name: String,
+    /// 2-D image dimensions (None for tables that aren't tile-compressed).
+    pub dims: Option<(usize, usize)>,
+}
+
+fn extname<X>(h: &fitsrs::hdu::header::Header<X>) -> Option<String>
+where X: fitsrs::hdu::header::extension::Xtension + std::fmt::Debug {
+    get_str(h, "EXTNAME")
+}
+
+/// Enumerate every HDU in the file along with its kind / dimensions. Useful
+/// for an "HDU navigator" — the user picks one and we re-load with [`load_hdu`].
+pub fn enumerate_hdus<P: AsRef<Path>>(path: P) -> Result<Vec<HduInfo>, FitsError> {
+    let f = File::open(path)?;
+    let mut hdus = Fits::from_reader(BufReader::new(f));
+    let mut out = Vec::new();
+    let mut idx = 0_usize;
+    while let Some(next) = hdus.next() {
+        let hdu = next.map_err(|e| FitsError::Parse(format!("{e:?}")))?;
+        let info = match &hdu {
+            HDU::Primary(p) => {
+                let n = p.get_header().get_xtension().get_naxis().to_vec();
+                let dims = if n.len() >= 2 && n[0] > 0 && n[1] > 0 {
+                    Some((n[0] as usize, n[1] as usize))
+                } else { None };
+                HduInfo {
+                    idx, kind: "PRIMARY",
+                    name: extname(p.get_header()).unwrap_or_else(|| "PRIMARY".into()),
+                    dims,
+                }
+            }
+            HDU::XImage(x) => {
+                let n = x.get_header().get_xtension().get_naxis().to_vec();
+                let dims = if n.len() >= 2 && n[0] > 0 && n[1] > 0 {
+                    Some((n[0] as usize, n[1] as usize))
+                } else { None };
+                HduInfo {
+                    idx, kind: "IMAGE",
+                    name: extname(x.get_header()).unwrap_or_else(|| format!("IMAGE#{idx}")),
+                    dims,
+                }
+            }
+            HDU::XBinaryTable(b) => {
+                let h = b.get_header();
+                let tile = h.get_xtension().get_z_image().is_some();
+                let dims = if tile {
+                    let w = get_f64(h, "ZNAXIS1").map(|v| v as usize);
+                    let hh = get_f64(h, "ZNAXIS2").map(|v| v as usize);
+                    match (w, hh) { (Some(a), Some(b)) => Some((a, b)), _ => None }
+                } else { None };
+                HduInfo {
+                    idx, kind: if tile { "TILE-COMPRESSED" } else { "TABLE" },
+                    name: extname(h).unwrap_or_else(|| {
+                        if tile { format!("TILE#{idx}") } else { format!("TABLE#{idx}") }
+                    }),
+                    dims,
+                }
+            }
+            _ => HduInfo { idx, kind: "OTHER", name: format!("HDU#{idx}"), dims: None },
+        };
+        out.push(info);
+        idx += 1;
+    }
+    Ok(out)
+}
+
+/// Load a specific HDU index. Falls back to `NoImageHdu` if the requested HDU
+/// isn't a 2-D image / tile-compressed table.
+pub fn load_hdu<P: AsRef<Path>>(path: P, target_idx: usize) -> Result<FitsImage, FitsError> {
+    let f = File::open(path)?;
+    let mut hdus = Fits::from_reader(BufReader::new(f));
+    let mut idx = 0_usize;
+    while let Some(next) = hdus.next() {
+        let hdu = next.map_err(|e| FitsError::Parse(format!("{e:?}")))?;
+        if idx != target_idx { idx += 1; continue; }
+        match hdu {
+            HDU::Primary(p) => {
+                let naxis: Vec<u64> = p.get_header().get_xtension().get_naxis().to_vec();
+                if naxis.len() < 2 || naxis[0] == 0 || naxis[1] == 0 {
+                    return Err(FitsError::NoImageHdu);
+                }
+                let w = naxis[0] as usize;
+                let h = naxis[1] as usize;
+                let plane = w.saturating_mul(h);
+                let wcs = try_parse_wcs(p.get_header());
+                let data = pixels_to_f32(hdus.get_data(&p), plane);
+                let (min, max) = finite_minmax(&data);
+                return Ok(FitsImage { width: w, height: h, data, min, max, wcs });
+            }
+            HDU::XImage(x) => {
+                let naxis: Vec<u64> = x.get_header().get_xtension().get_naxis().to_vec();
+                if naxis.len() < 2 || naxis[0] == 0 || naxis[1] == 0 {
+                    return Err(FitsError::NoImageHdu);
+                }
+                let w = naxis[0] as usize;
+                let h = naxis[1] as usize;
+                let plane = w.saturating_mul(h);
+                let wcs = try_parse_wcs(x.get_header());
+                let data = pixels_to_f32(hdus.get_data(&x), plane);
+                let (min, max) = finite_minmax(&data);
+                return Ok(FitsImage { width: w, height: h, data, min, max, wcs });
+            }
+            HDU::XBinaryTable(b) => {
+                if b.get_header().get_xtension().get_z_image().is_none() {
+                    return Err(FitsError::NoImageHdu);
+                }
+                let header_copy_needed = b.get_header().clone();
+                let data = hdus.get_data(&b);
+                if let Some(img) = load_tile_compressed(&header_copy_needed, data) {
+                    return Ok(img);
+                }
+                return Err(FitsError::NoImageHdu);
+            }
+            _ => return Err(FitsError::NoImageHdu),
+        }
+    }
+    Err(FitsError::NoImageHdu)
+}
+
 /// Load the first 2-D image we can find — primary HDU, an `XImage` extension,
 /// or a tile-compressed `XBinaryTable` (DESI / Legacy Survey `.fz` files).
 pub fn load<P: AsRef<Path>>(path: P) -> Result<FitsImage, FitsError> {
