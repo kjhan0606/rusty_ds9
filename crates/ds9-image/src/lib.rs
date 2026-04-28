@@ -241,6 +241,138 @@ pub fn render_grayscale(img: &FitsImage, lim: Limits, stretch: Stretch) -> Vec<u
     out
 }
 
+// -------------------------------------------------------------- orientation --
+
+/// Display-time image flip / 180° rotation. We deliberately omit 90° / 270°
+/// because those swap dimensions and would require remapping markers, which
+/// is its own batch of work — Identity / FlipH / FlipV / Rot180 cover the
+/// common "FITS is upside-down" needs and round-trip cleanly through the
+/// existing y-flip in `render_rgba_flipped`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Orientation {
+    #[default]
+    Identity,
+    FlipH,
+    FlipV,
+    Rot180,
+}
+
+impl Orientation {
+    pub fn name(self) -> &'static str {
+        match self {
+            Orientation::Identity => "identity",
+            Orientation::FlipH    => "flip-h",
+            Orientation::FlipV    => "flip-v",
+            Orientation::Rot180   => "rot180",
+        }
+    }
+    /// Map a display-pixel coord (0-based, y-down) under this orientation back
+    /// to the un-oriented image's display-pixel coord.
+    pub fn invert_display(self, x: f64, y: f64, w: f64, h: f64) -> (f64, f64) {
+        match self {
+            Orientation::Identity => (x, y),
+            Orientation::FlipH    => (w - 1.0 - x, y),
+            Orientation::FlipV    => (x, h - 1.0 - y),
+            Orientation::Rot180   => (w - 1.0 - x, h - 1.0 - y),
+        }
+    }
+    /// Forward map: un-oriented display coord → oriented display coord.
+    pub fn apply_display(self, x: f64, y: f64, w: f64, h: f64) -> (f64, f64) {
+        // these transforms are involutions, so forward == inverse
+        self.invert_display(x, y, w, h)
+    }
+}
+
+/// Apply orientation to a row-major RGBA buffer in-place. The buffer is
+/// `w × h × 4` bytes; both flips and Rot180 preserve `w` and `h`.
+pub fn apply_orientation_rgba(rgba: &mut [u8], w: usize, h: usize, o: Orientation) {
+    if matches!(o, Orientation::Identity) { return; }
+    let mut tmp = vec![0u8; rgba.len()];
+    for y in 0..h {
+        for x in 0..w {
+            let (sx, sy) = match o {
+                Orientation::Identity => (x, y),
+                Orientation::FlipH    => (w - 1 - x, y),
+                Orientation::FlipV    => (x, h - 1 - y),
+                Orientation::Rot180   => (w - 1 - x, h - 1 - y),
+            };
+            let src = (sy * w + sx) * 4;
+            let dst = (y  * w + x ) * 4;
+            tmp[dst..dst+4].copy_from_slice(&rgba[src..src+4]);
+        }
+    }
+    rgba.copy_from_slice(&tmp);
+}
+
+// -------------------------------------------------------------- custom LUT --
+
+/// Load a 256-entry colormap from a text file. Each non-empty, non-`#` line
+/// is `R G B` (whitespace-separated, 0-255 ints or 0.0-1.0 floats). Files with
+/// fewer rows are linearly resampled; files with more rows are sub-sampled.
+pub fn load_user_lut<P: AsRef<std::path::Path>>(path: P) -> std::io::Result<[[u8; 3]; 256]> {
+    let text = std::fs::read_to_string(path)?;
+    let mut stops: Vec<[u8; 3]> = Vec::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') { continue; }
+        let parts: Vec<f64> = line.split_whitespace().filter_map(|s| s.parse().ok()).collect();
+        if parts.len() < 3 { continue; }
+        let to_byte = |v: f64| -> u8 {
+            if v <= 1.0 { (v * 255.0).clamp(0.0, 255.0) as u8 }
+            else        { v.clamp(0.0, 255.0) as u8 }
+        };
+        stops.push([to_byte(parts[0]), to_byte(parts[1]), to_byte(parts[2])]);
+    }
+    if stops.is_empty() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "no color stops found"));
+    }
+    // resample to exactly 256 entries with linear interpolation
+    let n = stops.len();
+    let mut lut = [[0u8; 3]; 256];
+    for i in 0..256 {
+        let t = (i as f64 / 255.0) * (n - 1) as f64;
+        let lo = t.floor() as usize;
+        let hi = (lo + 1).min(n - 1);
+        let f  = (t - lo as f64) as f32;
+        for c in 0..3 {
+            let a = stops[lo][c] as f32;
+            let b = stops[hi][c] as f32;
+            lut[i][c] = (a + (b - a) * f).clamp(0.0, 255.0) as u8;
+        }
+    }
+    Ok(lut)
+}
+
+/// Render exactly like `render_rgba_flipped` but with an arbitrary 256-entry
+/// LUT (e.g. one loaded by `load_user_lut`).
+pub fn render_rgba_flipped_with_lut(
+    img: &FitsImage,
+    lim: Limits,
+    stretch: Stretch,
+    lut: &[[u8; 3]; 256],
+) -> Vec<u8> {
+    let span = (lim.high - lim.low).max(1e-30);
+    let w = img.width;
+    let h = img.height;
+    let mut out = vec![0u8; w * h * 4];
+    for y in 0..h {
+        let src_row = (h - 1 - y) * w;
+        let dst_row = y * w * 4;
+        for x in 0..w {
+            let v = img.data[src_row + x];
+            let n = if v.is_finite() { (v - lim.low) / span } else { 0.0 };
+            let idx = (apply(stretch, n) * 255.0).clamp(0.0, 255.0) as usize;
+            let [r, g, b] = lut[idx];
+            let i = dst_row + x * 4;
+            out[i]     = r;
+            out[i + 1] = g;
+            out[i + 2] = b;
+            out[i + 3] = 255;
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------- filters --
 
 /// Separable gaussian blur with kernel radius ≈ 3σ. Returns a new FitsImage
@@ -297,6 +429,81 @@ pub fn smooth_gaussian(img: &FitsImage, sigma: f32) -> FitsImage {
     FitsImage { width: w, height: h, data: out, min, max, wcs: img.wcs.clone() }
 }
 
+/// Boxcar smoothing — equivalent to a uniform mean filter over an `n × n`
+/// window (separable, NaN-aware). `n` is the *full* window width; pass `n=1`
+/// to disable. Skips NaN samples in the running sum.
+pub fn smooth_boxcar(img: &FitsImage, n: u32) -> FitsImage {
+    if n <= 1 { return clone_image(img); }
+    let n = n as usize;
+    let r = (n / 2) as i32;
+    let w = img.width;
+    let h = img.height;
+
+    // horizontal pass
+    let mut tmp = vec![f32::NAN; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let (mut sum, mut cnt) = (0.0_f32, 0u32);
+            for k in -r..=r {
+                let xi = x as i32 + k;
+                if xi < 0 || xi as usize >= w { continue; }
+                let v = img.data[y * w + xi as usize];
+                if v.is_finite() { sum += v; cnt += 1; }
+            }
+            tmp[y * w + x] = if cnt > 0 { sum / cnt as f32 } else { f32::NAN };
+        }
+    }
+    // vertical pass
+    let mut out = vec![f32::NAN; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let (mut sum, mut cnt) = (0.0_f32, 0u32);
+            for k in -r..=r {
+                let yi = y as i32 + k;
+                if yi < 0 || yi as usize >= h { continue; }
+                let v = tmp[yi as usize * w + x];
+                if v.is_finite() { sum += v; cnt += 1; }
+            }
+            out[y * w + x] = if cnt > 0 { sum / cnt as f32 } else { f32::NAN };
+        }
+    }
+    let (min, max) = finite_minmax(&out);
+    FitsImage { width: w, height: h, data: out, min, max, wcs: img.wcs.clone() }
+}
+
+/// Median smoothing over an `n × n` window. Not separable, but `n` is
+/// expected to be small (≤ 5) so an O(N·n²·log(n²)) sort is fine.
+pub fn smooth_median(img: &FitsImage, n: u32) -> FitsImage {
+    if n <= 1 { return clone_image(img); }
+    let n = n as usize;
+    let r = (n / 2) as i32;
+    let w = img.width;
+    let h = img.height;
+    let mut out = vec![f32::NAN; w * h];
+    let mut win: Vec<f32> = Vec::with_capacity(n * n);
+    for y in 0..h {
+        for x in 0..w {
+            win.clear();
+            for ky in -r..=r {
+                for kx in -r..=r {
+                    let xi = x as i32 + kx;
+                    let yi = y as i32 + ky;
+                    if xi < 0 || yi < 0 { continue; }
+                    if xi as usize >= w || yi as usize >= h { continue; }
+                    let v = img.data[yi as usize * w + xi as usize];
+                    if v.is_finite() { win.push(v); }
+                }
+            }
+            if !win.is_empty() {
+                win.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                out[y * w + x] = win[win.len() / 2];
+            }
+        }
+    }
+    let (min, max) = finite_minmax(&out);
+    FitsImage { width: w, height: h, data: out, min, max, wcs: img.wcs.clone() }
+}
+
 /// Block-average bin a factor `n` across both axes, then expand back so the
 /// returned image has the same size as the input (each NxN block holds the
 /// same averaged value). Visualization-only — the WCS / coords don't shift.
@@ -328,6 +535,63 @@ pub fn bin_average(img: &FitsImage, n: u32) -> FitsImage {
                 let row = yy * w;
                 for xx in x0..x1 {
                     out[row + xx] = avg;
+                }
+            }
+        }
+    }
+    let (min, max) = finite_minmax(&out);
+    FitsImage { width: w, height: h, data: out, min, max, wcs: img.wcs.clone() }
+}
+
+/// Block-sum bin: same expansion as `bin_average` but each block holds the
+/// *sum* of finite samples instead of the mean. Useful for photon-count maps.
+pub fn bin_sum(img: &FitsImage, n: u32) -> FitsImage {
+    if n <= 1 { return clone_image(img); }
+    let n = n as usize;
+    let w = img.width;
+    let h = img.height;
+    let mut out = vec![f32::NAN; w * h];
+    for y0 in (0..h).step_by(n) {
+        let y1 = (y0 + n).min(h);
+        for x0 in (0..w).step_by(n) {
+            let x1 = (x0 + n).min(w);
+            let mut sum = 0.0_f64;
+            let mut any = false;
+            for yy in y0..y1 {
+                for xx in x0..x1 {
+                    let v = img.data[yy * w + xx];
+                    if v.is_finite() { sum += v as f64; any = true; }
+                }
+            }
+            let val = if any { sum as f32 } else { f32::NAN };
+            for yy in y0..y1 {
+                for xx in x0..x1 {
+                    out[yy * w + xx] = val;
+                }
+            }
+        }
+    }
+    let (min, max) = finite_minmax(&out);
+    FitsImage { width: w, height: h, data: out, min, max, wcs: img.wcs.clone() }
+}
+
+/// Sub-sample bin: take the value at the top-left of each NxN block and
+/// expand it across the block. Cheaper than averaging and useful for spotting
+/// per-pixel artefacts at coarse zoom.
+pub fn bin_subsample(img: &FitsImage, n: u32) -> FitsImage {
+    if n <= 1 { return clone_image(img); }
+    let n = n as usize;
+    let w = img.width;
+    let h = img.height;
+    let mut out = vec![f32::NAN; w * h];
+    for y0 in (0..h).step_by(n) {
+        let y1 = (y0 + n).min(h);
+        for x0 in (0..w).step_by(n) {
+            let x1 = (x0 + n).min(w);
+            let val = img.data[y0 * w + x0];
+            for yy in y0..y1 {
+                for xx in x0..x1 {
+                    out[yy * w + xx] = val;
                 }
             }
         }
