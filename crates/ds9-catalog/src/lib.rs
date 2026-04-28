@@ -63,14 +63,100 @@ impl Catalog {
         Self { columns, rows }
     }
 
-    /// Auto-detect: if the first non-empty line starts with `#`, treat as
-    /// SExtractor; otherwise as TSV (or whitespace) depending on content.
+    /// Comma-separated values with a header row. Quoted fields ("…") are
+    /// supported but only as a flat string — no embedded comma escaping beyond
+    /// the surrounding quotes.
+    pub fn from_csv(input: &str) -> Self {
+        let split_csv = |line: &str| -> Vec<String> {
+            let mut out = Vec::new();
+            let mut cur = String::new();
+            let mut in_q = false;
+            for c in line.chars() {
+                match c {
+                    '"' => in_q = !in_q,
+                    ',' if !in_q => { out.push(cur.trim().to_string()); cur.clear(); }
+                    _ => cur.push(c),
+                }
+            }
+            out.push(cur.trim().to_string());
+            out
+        };
+        let mut lines = input.lines().filter(|l| !l.trim().is_empty());
+        let columns = lines.next().map(split_csv).unwrap_or_default();
+        let rows: Vec<Vec<String>> = lines.map(split_csv).collect();
+        Self { columns, rows }
+    }
+
+    /// Minimal VOTable parser — extracts FIELD names and TR/TD rows. Ignores
+    /// namespaces, attributes other than FIELD's `name=`, and any RESOURCE
+    /// nesting. Good enough for SIMBAD / Vizier output we care about.
+    pub fn from_votable(input: &str) -> Self {
+        let mut columns = Vec::new();
+        let mut rows: Vec<Vec<String>> = Vec::new();
+        let mut cur_row: Vec<String> = Vec::new();
+        let mut buf = input;
+        // simple "find next < … >" loop — values live between TD open/close tags
+        while let Some(open) = buf.find('<') {
+            let after_lt = &buf[open + 1..];
+            let close = match after_lt.find('>') { Some(c) => c, None => break };
+            let tag_full = &after_lt[..close];
+            let tag = tag_full.trim_start_matches('/').split_whitespace().next().unwrap_or("");
+            let is_close = tag_full.starts_with('/');
+            let body_start = open + 1 + close + 1;
+            // find next tag to delimit body
+            let next_lt = buf[body_start..].find('<').map(|p| body_start + p).unwrap_or(buf.len());
+            let body = buf[body_start..next_lt].trim();
+
+            let lc = tag.to_ascii_lowercase();
+            match lc.as_str() {
+                "field" if !is_close => {
+                    // pull `name="…"` from tag attributes
+                    let name = tag_full.split_whitespace().find_map(|tok| {
+                        let t = tok.trim_end_matches('/');
+                        let t = t.strip_prefix("name=")?;
+                        Some(t.trim_matches('"').trim_matches('\'').to_string())
+                    });
+                    columns.push(name.unwrap_or_else(|| format!("col{}", columns.len() + 1)));
+                }
+                "td" if !is_close => {
+                    // decode minimal entities and collect
+                    let v = body.replace("&amp;", "&")
+                        .replace("&lt;", "<").replace("&gt;", ">")
+                        .replace("&quot;", "\"");
+                    cur_row.push(v);
+                }
+                "tr" if is_close => {
+                    if !cur_row.is_empty() {
+                        rows.push(std::mem::take(&mut cur_row));
+                    }
+                }
+                _ => {}
+            }
+            buf = &buf[next_lt..];
+        }
+        // pad missing column names
+        if let Some(first) = rows.first() {
+            while columns.len() < first.len() {
+                columns.push(format!("col{}", columns.len() + 1));
+            }
+        }
+        Self { columns, rows }
+    }
+
+    /// Auto-detect from the first ~256 bytes — VOTable XML, SExtractor, CSV,
+    /// TSV, or bare whitespace.
     pub fn from_text_auto(input: &str) -> Self {
+        let head: String = input.chars().take(256).collect();
+        if head.contains("<VOTABLE") || head.contains("<votable") || head.contains("<TABLE") {
+            return Self::from_votable(input);
+        }
         let first = input.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
         if first.trim_start().starts_with('#') {
             Self::from_sextractor(input)
         } else if first.contains('\t') {
             Self::from_tsv(input)
+        } else if first.contains(',') {
+            Self::from_csv(input)
         } else {
             // bare whitespace-separated, no header — synthesize column names
             let rows: Vec<Vec<String>> = input.lines()
@@ -137,6 +223,39 @@ impl Catalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_csv() {
+        let txt = "X_IMAGE,Y_IMAGE,MAG\n100.5,200.3,18.5\n300.0,150.7,19.2\n";
+        let cat = Catalog::from_text_auto(txt);
+        assert_eq!(cat.columns, vec!["X_IMAGE","Y_IMAGE","MAG"]);
+        assert_eq!(cat.len(), 2);
+        let xy: Vec<_> = cat.xy_iter().collect();
+        assert_eq!(xy.len(), 2);
+        assert!((xy[0].0 - 100.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_votable() {
+        let txt = r#"<?xml version="1.0"?>
+<VOTABLE>
+  <RESOURCE><TABLE>
+    <FIELD name="X_IMAGE"/>
+    <FIELD name="Y_IMAGE"/>
+    <FIELD name="MAG"/>
+    <DATA><TABLEDATA>
+      <TR><TD>100.5</TD><TD>200.3</TD><TD>18.5</TD></TR>
+      <TR><TD>300.0</TD><TD>150.7</TD><TD>19.2</TD></TR>
+    </TABLEDATA></DATA>
+  </TABLE></RESOURCE>
+</VOTABLE>"#;
+        let cat = Catalog::from_text_auto(txt);
+        assert_eq!(cat.columns.len(), 3);
+        assert_eq!(cat.len(), 2);
+        let xy: Vec<_> = cat.xy_iter().collect();
+        assert_eq!(xy.len(), 2);
+        assert!((xy[1].1 - 150.7).abs() < 1e-6);
+    }
 
     #[test]
     fn parse_sextractor() {
