@@ -63,7 +63,7 @@ the selected source.
 | Scale     | Stretch (`linear`, `log`, `sqrt`, `squared`, `asinh`, `sinh`) + limits (`zscale`, `minmax`) |
 | Color     | Colormaps — `grey`, `red`, `green`, `blue`, `a`, `b`, `bb`, `heat`, `cool`, `rainbow`, `sls`, `hsv` |
 | Region    | `New`, `Load…`, `Save…`, `Delete Selected`, `Delete All`, `Info`                |
-| Catalog   | `Load…`, `Clear`, `Info`                                                         |
+| Catalog   | `Load…`, `Clear`, `Run SExtractor…` (external `source-extractor` wrapper), `Info` |
 | Analysis  | `Pixel Table…`, `Statistics…`, `Histogram…`, `Contour Levels…`, `Smooth (cycle)` (σ ∈ {0, 2, 4, 8} px), `Smooth Off` |
 
 ### Multi-frame
@@ -89,6 +89,19 @@ unchanged). Both filters are applied before stretch/colormap on every refresh an
 DS9 region files (`fk5`, `icrs`, `galactic`) load correctly when the active frame has a WCS — coordinates may be
 sexagesimal (`12:34:56.7`) or decimal degrees, and sizes use DS9's standard `"`/`'`/`d` suffixes. Without a WCS the
 parser falls back to `image` semantics and the status bar warns you.
+
+### SExtractor wrapper
+
+`Catalog ▸ Run SExtractor…` shells out to the external SExtractor binary
+(`source-extractor`, `sextractor`, or `sex`, in that PATH order) on the active frame's source FITS, parses the
+resulting `ASCII_HEAD` catalog, and overlays it on the image. Defaults are `DETECT_THRESH=1.5`, `DETECT_MINAREA=5`,
+`BACK_SIZE=64`. Override any SExtractor key via the `SEXTRACTOR_OPTS` environment variable, e.g.:
+
+```sh
+SEXTRACTOR_OPTS="-DETECT_THRESH 3.0 -DEBLEND_MINCONT 0.0001" ./target/release/ds9 image.fits
+```
+
+The IPC protocol exposes the same action as the `sextractor` verb.
 
 ### IPC (XPA-equivalent)
 
@@ -135,6 +148,7 @@ Implemented:
 - **Save Image** (PNG of current view) and **Save FITS** (basic BITPIX=−32 export with WCS preserved).
 - **Print** via `lpr` after rendering to a temp PNG.
 - **Unix-socket IPC** with a small DS9-style verb language (`frame next`, `scale log`, `region load`, `save png`, …).
+- **SExtractor wrapper** — `Catalog ▸ Run SExtractor…` (or IPC verb `sextractor`) runs the external `source-extractor` binary on the active frame's source FITS and overlays the resulting catalog.
 
 Not yet ported (open candidates):
 

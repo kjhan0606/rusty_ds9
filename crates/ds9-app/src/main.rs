@@ -27,6 +27,9 @@ enum LimitsMode {
 struct Frame {
     fits: FitsImage,
     name: String,
+    /// Path on disk this frame was loaded from (None for synthetic / RGB / etc).
+    /// External tools (SExtractor wrapper, …) need a real file to read.
+    source_path: Option<PathBuf>,
     stretch: Stretch,
     limits_mode: LimitsMode,
     cmap: Colormap,
@@ -50,6 +53,7 @@ impl Frame {
         Self {
             fits,
             name,
+            source_path: None,
             stretch: Stretch::Linear,
             limits_mode: LimitsMode::Zscale,
             cmap: Colormap::Grey,
@@ -556,7 +560,9 @@ fn load_into(window: &MainWindow, st: &mut State, path: &Path) {
             let (w, h, mn, mx) = (img.width, img.height, img.min, img.max);
             // persist the outgoing frame's view so we don't clobber it on switch
             save_view_into_active(window, st);
-            st.frames.push(Frame::new(img, name));
+            let mut fr = Frame::new(img, name);
+            fr.source_path = Some(path.to_path_buf());
+            st.frames.push(fr);
             st.active = st.frames.len() - 1;
             window.set_status_text(
                 format!("loaded {w} × {h}    range {mn:.4} … {mx:.4}    [frame {}]", st.active + 1).into(),
@@ -661,6 +667,145 @@ fn catalog_load(window: &MainWindow, st: &mut State) {
             refresh_view(window, st);
         }
         Err(e) => window.set_status_text(format!("catalog read error: {e}").into()),
+    }
+}
+
+/// Try to find a usable SExtractor binary on $PATH. Different distributions
+/// install it under different names — `sex` (classic), `source-extractor`
+/// (Debian/Ubuntu since `sex` collided with… you know what), or `sextractor`.
+fn find_sextractor() -> Option<String> {
+    for name in ["source-extractor", "sextractor", "sex"] {
+        match std::process::Command::new(name)
+            .arg("-v")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+        {
+            Ok(_) => return Some(name.to_string()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            // exists but argument failed — still usable
+            Err(_) => return Some(name.to_string()),
+        }
+    }
+    None
+}
+
+/// Spawn an external SExtractor on the active frame's source FITS, parse the
+/// resulting `ASCII_HEAD` catalog, and load it into the frame.
+///
+/// Defaults: `DETECT_THRESH=1.5`, `DETECT_MINAREA=5`, `BACK_SIZE=64`,
+/// `CATALOG_TYPE=ASCII_HEAD`. Override by setting `SEXTRACTOR_OPTS` in the
+/// environment — its tokens are appended to the command line so any
+/// SExtractor `-KEY VALUE` pair works (e.g. `SEXTRACTOR_OPTS="-DETECT_THRESH 3.0"`).
+fn run_sextractor(window: &MainWindow, st: &mut State) {
+    let (idx, fits_path, name) = {
+        let Some(f) = st.active_frame() else {
+            window.set_status_text("sextractor: no active frame".into()); return;
+        };
+        let Some(p) = f.source_path.clone() else {
+            window.set_status_text(
+                "sextractor: active frame has no on-disk path (RGB / synthetic)".into()
+            );
+            return;
+        };
+        (st.active, p, f.name.clone())
+    };
+
+    let bin = match find_sextractor() {
+        Some(b) => b,
+        None => {
+            window.set_status_text(
+                "sextractor: binary not found on PATH (tried source-extractor, sextractor, sex)".into()
+            );
+            return;
+        }
+    };
+
+    let tmp = std::env::temp_dir()
+        .join(format!("ds9-rust-sex-{}-{}", std::process::id(), idx));
+    if let Err(e) = std::fs::create_dir_all(&tmp) {
+        window.set_status_text(format!("sextractor: tmpdir: {e}").into()); return;
+    }
+    let cfg = tmp.join("default.sex");
+    let par = tmp.join("default.param");
+    let cat = tmp.join("out.cat");
+
+    let cfg_text = "\
+# ds9-rust default SExtractor config
+DETECT_TYPE      CCD
+DETECT_MINAREA   5
+DETECT_THRESH    1.5
+ANALYSIS_THRESH  1.5
+FILTER           N
+DEBLEND_NTHRESH  32
+DEBLEND_MINCONT  0.005
+CLEAN            Y
+CLEAN_PARAM      1.0
+PHOT_APERTURES   5
+SATUR_LEVEL      50000.0
+MAG_ZEROPOINT    0.0
+GAIN             0.0
+PIXEL_SCALE      0.0
+SEEING_FWHM      1.2
+BACK_SIZE        64
+BACK_FILTERSIZE  3
+BACKPHOTO_TYPE   GLOBAL
+";
+    let par_text = "\
+NUMBER
+X_IMAGE
+Y_IMAGE
+MAG_AUTO
+FLUX_AUTO
+A_IMAGE
+B_IMAGE
+THETA_IMAGE
+FLAGS
+";
+    if let Err(e) = std::fs::write(&cfg, cfg_text) {
+        window.set_status_text(format!("sextractor: write cfg: {e}").into()); return;
+    }
+    if let Err(e) = std::fs::write(&par, par_text) {
+        window.set_status_text(format!("sextractor: write par: {e}").into()); return;
+    }
+
+    let mut cmd = std::process::Command::new(&bin);
+    cmd.current_dir(&tmp)
+        .arg(&fits_path)
+        .arg("-c").arg(&cfg)
+        .arg("-CATALOG_NAME").arg(&cat)
+        .arg("-CATALOG_TYPE").arg("ASCII_HEAD")
+        .arg("-PARAMETERS_NAME").arg(&par);
+
+    if let Ok(opts) = std::env::var("SEXTRACTOR_OPTS") {
+        for token in opts.split_whitespace() { cmd.arg(token); }
+    }
+
+    window.set_status_text(format!("sextractor: running on {name}…").into());
+    let output = match cmd.output() {
+        Ok(o) => o,
+        Err(e) => { window.set_status_text(format!("sextractor: spawn: {e}").into()); return; }
+    };
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let first = stderr.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("");
+        window.set_status_text(format!("sextractor failed: {first}").into());
+        return;
+    }
+
+    match Catalog::from_path(&cat) {
+        Ok(c) => {
+            let n = c.len();
+            if let Some(f) = st.frames.get_mut(idx) {
+                f.catalog = Some(c);
+                f.selected_catalog = None;
+            }
+            refresh_view(window, st);
+            window.set_status_text(format!(
+                "sextractor: detected {n} sources from {name} ({})", bin
+            ).into());
+        }
+        Err(e) => window.set_status_text(format!("sextractor: read catalog: {e}").into()),
     }
 }
 
@@ -1007,6 +1152,7 @@ fn handle_menu(window: &MainWindow, st: &mut State, menu: &str, item: &str) {
         // Catalog
         ("Catalog", "Load…") => { catalog_load(window, st); }
         ("Catalog", "Clear") => { catalog_clear(window, st); }
+        ("Catalog", "Run SExtractor…") => { run_sextractor(window, st); }
         ("Catalog", "Info")  => {
             let msg = match st.active_frame().and_then(|f| f.catalog.as_ref()) {
                 Some(c) => format!(
@@ -1207,6 +1353,10 @@ fn dispatch_ipc(window: &MainWindow, st: &mut State, line: &str) -> String {
                 Ok(()) => "ok".into(), Err(e) => format!("err {e}"),
             }
         }
+        ["sextractor"] => {
+            run_sextractor(window, st);
+            "ok".into()
+        }
         ["value"] => {
             let cx = window.get_cursor_image_x() as i32;
             let cy = window.get_cursor_image_y() as i32;
@@ -1218,7 +1368,7 @@ fn dispatch_ipc(window: &MainWindow, st: &mut State, line: &str) -> String {
                 } else { "err out of bounds".into() }
             } else { "err no frame".into() }
         }
-        ["help"] => "commands: quit | frame next|previous|N | scale S | cmap C | bin N | zoom in|out|fit|N | region load|save P | file open P | save png|fits P | value | help".into(),
+        ["help"] => "commands: quit | frame next|previous|N | scale S | cmap C | bin N | zoom in|out|fit|N | region load|save P | file open P | save png|fits P | value | sextractor | help".into(),
         _ => format!("err unknown: {line}"),
     }
 }

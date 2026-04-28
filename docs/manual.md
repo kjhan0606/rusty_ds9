@@ -31,9 +31,10 @@
 10. [Analysis tools](#10-analysis-tools)
 11. [Saving & printing](#11-saving--printing)
 12. [IPC protocol](#12-ipc-protocol)
-13. [Cookbook](#13-cookbook)
-14. [Troubleshooting](#14-troubleshooting)
-15. [Architecture](#15-architecture)
+13. [SExtractor wrapper](#13-sextractor-wrapper)
+14. [Cookbook](#14-cookbook)
+15. [Troubleshooting](#15-troubleshooting)
+16. [Architecture](#16-architecture)
 
 ---
 
@@ -175,11 +176,12 @@ readout follows the FITS header's `RADESYS`; format toggle is reserved.
 
 ### Catalog
 
-| Item     | What it does                                                  |
-|----------|---------------------------------------------------------------|
-| `Load…`  | Pick a TSV / SExtractor catalog and overlay points on the image |
-| `Clear`  | Remove the catalog from the active frame                      |
-| `Info`   | Status-bar summary (rows, columns, detected `X/Y` columns)    |
+| Item                | What it does                                                            |
+|---------------------|-------------------------------------------------------------------------|
+| `Load…`             | Pick a TSV / SExtractor catalog and overlay points on the image         |
+| `Clear`             | Remove the catalog from the active frame                                |
+| `Run SExtractor…`   | Shell out to `source-extractor` on the active frame's source FITS       |
+| `Info`              | Status-bar summary (rows, columns, detected `X/Y` columns)              |
 
 ---
 
@@ -511,6 +513,7 @@ The socket path is also printed to stderr at startup and shown in the status bar
 | `save png PATH`              | PNG export of the current view                                     |
 | `save fits PATH`             | FITS export of the underlying data                                 |
 | `value`                      | Print the value at the last cursor position                       |
+| `sextractor`                 | Run the external SExtractor wrapper on the active frame ([§ 13](#13-sextractor-wrapper)) |
 | `help`                       | List all commands in one line                                     |
 
 Replies are one line each: `ok`, `ok <message>`, or `err <reason>`.
@@ -542,7 +545,97 @@ print(sock.recv(4096).decode())
 
 ---
 
-## 13. Cookbook
+## 13. SExtractor wrapper
+
+ds9-rust does not implement source detection itself, but it ships a thin wrapper around the canonical
+[SExtractor](https://www.astromatic.net/software/sextractor/) binary so you can detect, photometer, and overlay
+sources without leaving the viewer.
+
+### Requirements
+
+A working SExtractor on `$PATH`. The wrapper tries these names in order:
+
+```
+source-extractor   # Debian / Ubuntu (since the `sex` collision with another package)
+sextractor         # most other distros
+sex                # classic upstream name
+```
+
+If none is found you'll get a status-bar message naming everything that was tried.
+
+### Running
+
+`Catalog ▸ Run SExtractor…` runs the binary with these defaults:
+
+```
+DETECT_TYPE      CCD
+DETECT_MINAREA   5
+DETECT_THRESH    1.5
+ANALYSIS_THRESH  1.5
+FILTER           N
+DEBLEND_NTHRESH  32
+DEBLEND_MINCONT  0.005
+CLEAN            Y
+PHOT_APERTURES   5
+SATUR_LEVEL      50000.0
+MAG_ZEROPOINT    0.0
+BACK_SIZE        64
+BACK_FILTERSIZE  3
+BACKPHOTO_TYPE   GLOBAL
+```
+
+with the parameter set:
+
+```
+NUMBER  X_IMAGE  Y_IMAGE  MAG_AUTO  FLUX_AUTO  A_IMAGE  B_IMAGE  THETA_IMAGE  FLAGS
+```
+
+Output is captured as `ASCII_HEAD` and immediately loaded into the active frame as a catalog overlay (so all the
+catalog UI — click-to-select, magnitude column, recenter — works on the detection result).
+
+> **Heads-up.** The wrapper feeds the *original* on-disk FITS path to SExtractor — not the in-memory data — so
+> stretches / cmap / smooth / bin do not affect detection. If you want to detect on a transformed image, save it
+> first via `File ▸ Save FITS…` and re-open it.
+
+### Custom options
+
+Set `SEXTRACTOR_OPTS` in the environment before launching ds9-rust to append SExtractor flags:
+
+```sh
+SEXTRACTOR_OPTS="-DETECT_THRESH 3.0 -DEBLEND_MINCONT 0.0001" \
+    ./target/release/ds9 deep_field.fits
+```
+
+Tokens are passed verbatim, so any `-KEY VALUE` pair SExtractor accepts is fair game. The wrapper still controls
+`-c`, `-CATALOG_NAME`, `-CATALOG_TYPE`, and `-PARAMETERS_NAME` to keep the parser happy.
+
+### Driving from the IPC
+
+```sh
+SOCK=${XDG_RUNTIME_DIR:-/tmp}/ds9-rust-$USER.sock
+echo "file open /data/deep.fits" | nc -U "$SOCK"
+echo "scale asinh"               | nc -U "$SOCK"
+echo "sextractor"                | nc -U "$SOCK"
+```
+
+The `sextractor` verb runs against whichever frame is active.
+
+### Where do the temp files go?
+
+Each run gets its own directory under `$TMPDIR`:
+
+```
+$TMPDIR/ds9-rust-sex-<pid>-<frame_idx>/
+    default.sex      # the config above
+    default.param    # the param set above
+    out.cat          # the catalog SExtractor produced
+```
+
+Inspect these if a run fails — SExtractor's stderr is also surfaced in the status bar.
+
+---
+
+## 14. Cookbook
 
 ### A. Inspect a survey image with a SExtractor catalog
 
@@ -595,7 +688,7 @@ done
 
 ---
 
-## 14. Troubleshooting
+## 15. Troubleshooting
 
 | Symptom                                          | Likely cause / fix                                                  |
 |--------------------------------------------------|---------------------------------------------------------------------|
@@ -606,10 +699,12 @@ done
 | Catalog points off by one pixel                  | Catalog was written in 0-based image coords; ds9-rust expects 1-based FITS coords |
 | IPC `nc -U` hangs                                | The protocol is request/response per line — close stdin (`echo "..." \| nc -q1 -U`) or use `socat - UNIX-CONNECT:$SOCK` |
 | Blink doesn't advance                            | You need ≥ 2 frames loaded; `frame N` in IPC is 1-based                |
+| `sextractor: binary not found`                   | Install SExtractor (`apt install source-extractor` / `brew install sextractor` / build from astromatic.net) |
+| `sextractor failed: ...`                         | Look at `$TMPDIR/ds9-rust-sex-<pid>-<idx>/`. Common: missing FITS file (frame is RGB / synthetic), no source path, or your `SEXTRACTOR_OPTS` introduced an invalid key |
 
 ---
 
-## 15. Architecture
+## 16. Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
