@@ -3,7 +3,7 @@
 // is intentional: deep slate background, teal accent, monospace readouts —
 // reads as a dark-room observatory console rather than a generic Material app.
 
-import { ScrollView } from "std-widgets.slint";
+import { ScrollView, LineEdit, Button } from "std-widgets.slint";
 
 // Markers are rendered in canvas/image-pixel space (0-based, top-left, y-down).
 // Conversion from DS9's 1-based, bottom-up FITS coords happens in Rust.
@@ -529,6 +529,20 @@ export component MainWindow inherits Window {
     // ---- blink mode toggle (Rust drives a 500-ms timer that calls Frame Next while on) ----
     in-out property <bool> blink-active: false;
 
+    // ---- region property editor (operates on the selected marker) ----
+    in-out property <bool>   region-prop-visible: false;
+    in-out property <string> region-prop-kind:    "—";
+    in-out property <string> region-prop-x:       "";
+    in-out property <string> region-prop-y:       "";
+    in-out property <string> region-prop-size1:   "";    // r / w / a / r_outer / dx
+    in-out property <string> region-prop-size2:   "";    // -- / h / b / r_inner / dy
+    in-out property <string> region-prop-angle:   "";    // theta_deg
+    in-out property <string> region-prop-color:   "";    // hex "#rrggbb"
+    in-out property <string> region-prop-text:    "";    // text body (Text shape)
+    in-out property <string> region-prop-status:  "";
+    callback region-prop-apply();
+    callback region-prop-revert();
+
     // ---- HDU navigator panel ----
     in-out property <bool>     hdu-panel-visible: false;
     in-out property <[HduRow]> hdu-rows: [];
@@ -638,7 +652,8 @@ export component MainWindow inherits Window {
                 MenuBarItem {
                     label: "Region";
                     items: ["New", "Load…", "Save…", "—", "Delete Selected", "Delete All", "—",
-                            "Projection…", "Radial Profile…", "Centroid", "—", "Info"];
+                            "Projection…", "Radial Profile…", "Centroid", "Properties…",
+                            "—", "Info"];
                     chosen(it) => { root.menu-action("Region", it); }
                 }
                 MenuBarItem {
@@ -924,6 +939,143 @@ export component MainWindow inherits Window {
                         source: root.histogram-image;
                         image-fit: fill;
                         image-rendering: smooth;
+                    }
+                }
+
+                // floating Region Properties editor panel
+                if root.region-prop-visible: Rectangle {
+                    x: 12px;
+                    y: 330px;
+                    width: 360px;
+                    height: 290px;
+                    background: Style.bg-panel;
+                    border-color: Style.border-hi;
+                    border-width: 1px;
+                    border-radius: 3px;
+
+                    Text {
+                        x: 8px; y: 4px;
+                        text: "REGION PROPERTIES  " + root.region-prop-kind;
+                        color: Style.accent;
+                        font-size: 10px;
+                        font-family: Style.mono;
+                    }
+                    Rectangle {
+                        x: parent.width - 22px; y: 3px;
+                        width: 18px; height: 18px;
+                        background: rpcta.has-hover ? Style.bg-hover : transparent;
+                        border-radius: 2px;
+                        Text {
+                            x: 4px; y: -1px;
+                            text: "×";
+                            color: Style.text;
+                            font-size: 14px;
+                            font-family: Style.mono;
+                        }
+                        rpcta := TouchArea {
+                            clicked => { root.region-prop-visible = false; }
+                        }
+                    }
+
+                    VerticalLayout {
+                        x: 8px; y: 24px;
+                        width: parent.width - 16px;
+                        height: parent.height - 32px;
+                        spacing: 4px;
+
+                        // x / y row
+                        HorizontalLayout {
+                            spacing: 4px; height: 24px;
+                            Text { text: "x"; color: Style.text-dim; font-size: 11px;
+                                   font-family: Style.mono; vertical-alignment: center; width: 14px; }
+                            LineEdit {
+                                text <=> root.region-prop-x;
+                                horizontal-stretch: 1;
+                                accepted(s) => { root.region-prop-apply(); }
+                            }
+                            Text { text: "y"; color: Style.text-dim; font-size: 11px;
+                                   font-family: Style.mono; vertical-alignment: center; width: 14px; }
+                            LineEdit {
+                                text <=> root.region-prop-y;
+                                horizontal-stretch: 1;
+                                accepted(s) => { root.region-prop-apply(); }
+                            }
+                        }
+                        // size1 / size2 row
+                        HorizontalLayout {
+                            spacing: 4px; height: 24px;
+                            Text { text: "s1"; color: Style.text-dim; font-size: 11px;
+                                   font-family: Style.mono; vertical-alignment: center; width: 14px; }
+                            LineEdit {
+                                text <=> root.region-prop-size1;
+                                horizontal-stretch: 1;
+                                accepted(s) => { root.region-prop-apply(); }
+                            }
+                            Text { text: "s2"; color: Style.text-dim; font-size: 11px;
+                                   font-family: Style.mono; vertical-alignment: center; width: 14px; }
+                            LineEdit {
+                                text <=> root.region-prop-size2;
+                                horizontal-stretch: 1;
+                                accepted(s) => { root.region-prop-apply(); }
+                            }
+                        }
+                        // angle row
+                        HorizontalLayout {
+                            spacing: 4px; height: 24px;
+                            Text { text: "θ°"; color: Style.text-dim; font-size: 11px;
+                                   font-family: Style.mono; vertical-alignment: center; width: 14px; }
+                            LineEdit {
+                                text <=> root.region-prop-angle;
+                                horizontal-stretch: 1;
+                                accepted(s) => { root.region-prop-apply(); }
+                            }
+                        }
+                        // color hex row
+                        HorizontalLayout {
+                            spacing: 4px; height: 24px;
+                            Text { text: "#"; color: Style.text-dim; font-size: 11px;
+                                   font-family: Style.mono; vertical-alignment: center; width: 14px; }
+                            LineEdit {
+                                text <=> root.region-prop-color;
+                                horizontal-stretch: 1;
+                                placeholder-text: "#rrggbb";
+                                accepted(s) => { root.region-prop-apply(); }
+                            }
+                        }
+                        // text body (only meaningful for Text shape)
+                        HorizontalLayout {
+                            spacing: 4px; height: 24px;
+                            Text { text: "t"; color: Style.text-dim; font-size: 11px;
+                                   font-family: Style.mono; vertical-alignment: center; width: 14px; }
+                            LineEdit {
+                                text <=> root.region-prop-text;
+                                horizontal-stretch: 1;
+                                accepted(s) => { root.region-prop-apply(); }
+                            }
+                        }
+
+                        // status line
+                        Text {
+                            text: root.region-prop-status;
+                            color: Style.text-dim;
+                            font-size: 10px;
+                            font-family: Style.mono;
+                            wrap: word-wrap;
+                        }
+
+                        // buttons
+                        HorizontalLayout {
+                            spacing: 6px; height: 26px;
+                            Button {
+                                text: "Apply";
+                                clicked => { root.region-prop-apply(); }
+                            }
+                            Button {
+                                text: "Revert";
+                                clicked => { root.region-prop-revert(); }
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                        }
                     }
                 }
 

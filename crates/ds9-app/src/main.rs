@@ -1722,6 +1722,187 @@ fn hex_nib(n: u8) -> u8 {
     if n < 10 { b'0' + n } else { b'a' + (n - 10) }
 }
 
+// -------------------------------------------------- region property editor --
+
+/// Encode a marker color (RGBA u8) as `"#rrggbb"`. Alpha is dropped — we
+/// don't expose it in the editor.
+fn color_to_hex(c: [u8; 4]) -> String {
+    format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2])
+}
+
+/// Parse `"#rrggbb"` (or `"rrggbb"`) into an RGB triple, alpha defaults to
+/// the marker's existing alpha. Returns None on a malformed string.
+fn parse_hex_rgb(s: &str) -> Option<[u8; 3]> {
+    let s = s.trim().trim_start_matches('#');
+    if s.len() != 6 { return None; }
+    let r = u8::from_str_radix(&s[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&s[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+    Some([r, g, b])
+}
+
+fn fmt_num(v: f64) -> slint::SharedString { format!("{:.2}", v).into() }
+
+/// Push the active frame's selected marker into the slint property editor
+/// fields. Sets the kind label, x/y/size/angle/color/text strings, and an
+/// informational status row. Empty kind means "no selection".
+fn populate_region_props(window: &MainWindow, st: &State) {
+    let Some(f) = st.active_frame() else {
+        window.set_region_prop_kind("—".into());
+        window.set_region_prop_status("(no active frame)".into());
+        return;
+    };
+    let Some(idx) = f.selected_marker else {
+        window.set_region_prop_kind("(no selection)".into());
+        window.set_region_prop_status(
+            "click a region in edit mode to select, then reopen Properties…".into()
+        );
+        return;
+    };
+    let Some(m) = f.markers.get(idx) else { return };
+    let (kind, x, y, s1, s2, ang, text) = match &m.shape {
+        MShape::Circle { center, r } => (
+            "Circle", center.x, center.y, *r, 0.0, 0.0, String::new(),
+        ),
+        MShape::Box { center, w, h, theta_deg } => (
+            "Box", center.x, center.y, *w, *h, *theta_deg, String::new(),
+        ),
+        MShape::Ellipse { center, a, b, theta_deg } => (
+            "Ellipse", center.x, center.y, *a, *b, *theta_deg, String::new(),
+        ),
+        MShape::Annulus { center, r_inner, r_outer } => (
+            "Annulus", center.x, center.y, *r_outer, *r_inner, 0.0, String::new(),
+        ),
+        MShape::Point { center } => (
+            "Point", center.x, center.y, 0.0, 0.0, 0.0, String::new(),
+        ),
+        MShape::Line { from, to } => (
+            "Line", from.x, from.y, to.x, to.y, 0.0, String::new(),
+        ),
+        MShape::Compass { center, len } => (
+            "Compass", center.x, center.y, *len, 0.0, 0.0, String::new(),
+        ),
+        MShape::Text { center, body } => (
+            "Text", center.x, center.y, 0.0, 0.0, 0.0, body.clone(),
+        ),
+        MShape::Polygon { points } => {
+            window.set_region_prop_kind(format!("Polygon ({} pts, read-only)", points.len()).into());
+            window.set_region_prop_x(points.first().map(|p| fmt_num(p.x)).unwrap_or_default());
+            window.set_region_prop_y(points.first().map(|p| fmt_num(p.y)).unwrap_or_default());
+            window.set_region_prop_size1("".into());
+            window.set_region_prop_size2("".into());
+            window.set_region_prop_angle("".into());
+            window.set_region_prop_color(color_to_hex(m.color).into());
+            window.set_region_prop_text("".into());
+            window.set_region_prop_status(
+                "polygons can only have their color edited from this panel".into()
+            );
+            return;
+        }
+    };
+    window.set_region_prop_kind(format!("#{} {}", idx + 1, kind).into());
+    window.set_region_prop_x(fmt_num(x));
+    window.set_region_prop_y(fmt_num(y));
+    window.set_region_prop_size1(if s1 == 0.0 && !matches!(m.shape, MShape::Line { .. }) { "".into() } else { fmt_num(s1) });
+    window.set_region_prop_size2(if s2 == 0.0 && !matches!(m.shape, MShape::Line { .. }) { "".into() } else { fmt_num(s2) });
+    window.set_region_prop_angle(if ang == 0.0 && !matches!(m.shape, MShape::Box { .. } | MShape::Ellipse { .. }) { "".into() } else { fmt_num(ang) });
+    window.set_region_prop_color(color_to_hex(m.color).into());
+    window.set_region_prop_text(text.into());
+    window.set_region_prop_status(
+        format!("editing region #{} ({}). press Enter or Apply to commit.", idx + 1, kind).into()
+    );
+}
+
+/// Read the slint editor fields and write them back into the active frame's
+/// selected marker. Logs the outcome to the panel's status row.
+fn apply_region_props(window: &MainWindow, st: &mut State) {
+    let Some(idx) = st.active_frame().and_then(|f| f.selected_marker) else {
+        window.set_region_prop_status("apply: no selection".into()); return;
+    };
+    let parse = |s: slint::SharedString| -> Option<f64> {
+        let s = s.as_str().trim();
+        if s.is_empty() { None } else { s.parse::<f64>().ok() }
+    };
+    let x   = parse(window.get_region_prop_x());
+    let y   = parse(window.get_region_prop_y());
+    let s1  = parse(window.get_region_prop_size1());
+    let s2  = parse(window.get_region_prop_size2());
+    let ang = parse(window.get_region_prop_angle());
+    let color = parse_hex_rgb(window.get_region_prop_color().as_str());
+    let body  = window.get_region_prop_text().as_str().to_string();
+
+    let mut applied = Vec::<&'static str>::new();
+    let Some(f) = st.active_frame_mut() else { return };
+    let Some(m) = f.markers.get_mut(idx) else { return };
+    if let Some([r, g, b]) = color {
+        m.color = [r, g, b, m.color[3]];
+        applied.push("color");
+    }
+    use ds9_marker::PixelPos;
+    match &mut m.shape {
+        MShape::Circle { center, r } => {
+            if let Some(v) = x { center.x = v; applied.push("x"); }
+            if let Some(v) = y { center.y = v; applied.push("y"); }
+            if let Some(v) = s1 { *r = v; applied.push("r"); }
+        }
+        MShape::Box { center, w, h, theta_deg } => {
+            if let Some(v) = x { center.x = v; applied.push("x"); }
+            if let Some(v) = y { center.y = v; applied.push("y"); }
+            if let Some(v) = s1 { *w = v; applied.push("w"); }
+            if let Some(v) = s2 { *h = v; applied.push("h"); }
+            if let Some(v) = ang { *theta_deg = v; applied.push("θ"); }
+        }
+        MShape::Ellipse { center, a, b, theta_deg } => {
+            if let Some(v) = x { center.x = v; applied.push("x"); }
+            if let Some(v) = y { center.y = v; applied.push("y"); }
+            if let Some(v) = s1 { *a = v; applied.push("a"); }
+            if let Some(v) = s2 { *b = v; applied.push("b"); }
+            if let Some(v) = ang { *theta_deg = v; applied.push("θ"); }
+        }
+        MShape::Annulus { center, r_inner, r_outer } => {
+            if let Some(v) = x { center.x = v; applied.push("x"); }
+            if let Some(v) = y { center.y = v; applied.push("y"); }
+            if let Some(v) = s1 { *r_outer = v; applied.push("r_outer"); }
+            if let Some(v) = s2 { *r_inner = v; applied.push("r_inner"); }
+        }
+        MShape::Point { center } => {
+            if let Some(v) = x { center.x = v; applied.push("x"); }
+            if let Some(v) = y { center.y = v; applied.push("y"); }
+        }
+        MShape::Line { from, to } => {
+            if let Some(v) = x { from.x = v; applied.push("from.x"); }
+            if let Some(v) = y { from.y = v; applied.push("from.y"); }
+            if let Some(v) = s1 { to.x = v; applied.push("to.x"); }
+            if let Some(v) = s2 { to.y = v; applied.push("to.y"); }
+        }
+        MShape::Compass { center, len } => {
+            if let Some(v) = x { center.x = v; applied.push("x"); }
+            if let Some(v) = y { center.y = v; applied.push("y"); }
+            if let Some(v) = s1 { *len = v; applied.push("len"); }
+        }
+        MShape::Text { center, body: existing } => {
+            if let Some(v) = x { center.x = v; applied.push("x"); }
+            if let Some(v) = y { center.y = v; applied.push("y"); }
+            if !body.is_empty() && body != *existing {
+                *existing = body.clone();
+                applied.push("text");
+            }
+        }
+        MShape::Polygon { .. } => {
+            // color already applied above; geometry is read-only here
+            let _ = (x, y, s1, s2, ang);
+            let _ = PixelPos { x: 0.0, y: 0.0 };
+        }
+    }
+    let msg = if applied.is_empty() {
+        format!("apply: nothing changed")
+    } else {
+        format!("applied: {}", applied.join(", "))
+    };
+    window.set_region_prop_status(msg.into());
+    refresh_view(window, st);
+}
+
 // -------------------------------------------------------- region analysis --
 
 /// Iterate (x_fits, y_fits, value) over every finite pixel inside a circular
@@ -2307,6 +2488,16 @@ fn handle_menu(window: &MainWindow, st: &mut State, menu: &str, item: &str) {
                 if on { format!("projection: {} samples along {:.1} px", samples.len(), len).into() }
                 else  { "projection: hidden".into() }
             );
+        }
+        ("Region", "Properties…") => {
+            if window.get_region_prop_visible() {
+                window.set_region_prop_visible(false);
+                window.set_status_text("region properties: hidden".into());
+            } else {
+                populate_region_props(window, st);
+                window.set_region_prop_visible(true);
+                window.set_status_text("region properties: shown".into());
+            }
         }
         ("Region", "Centroid") => {
             // Find a marker with a circular extent (selected first, else first
@@ -3100,6 +3291,24 @@ fn main() -> Result<()> {
             let Some(w) = weak.upgrade() else { return };
             if idx < 0 { return; }
             load_hdu_into_active(&w, &mut state.borrow_mut(), idx as usize);
+        });
+    }
+
+    // ---- Region property editor — Apply + Revert buttons ----
+    {
+        let weak = win.as_weak();
+        let state = Rc::clone(&state);
+        win.on_region_prop_apply(move || {
+            let Some(w) = weak.upgrade() else { return };
+            apply_region_props(&w, &mut state.borrow_mut());
+        });
+    }
+    {
+        let weak = win.as_weak();
+        let state = Rc::clone(&state);
+        win.on_region_prop_revert(move || {
+            let Some(w) = weak.upgrade() else { return };
+            populate_region_props(&w, &state.borrow());
         });
     }
 
