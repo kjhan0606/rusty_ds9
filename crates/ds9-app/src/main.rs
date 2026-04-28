@@ -1510,6 +1510,118 @@ fn build_rgb_composite(frames: &[Frame]) -> Option<(Image, usize, usize)> {
     Some((Image::from_rgba8(buf), w, h))
 }
 
+// ---------------------------------------------------------------- mosaic --
+
+/// Build a WCS mosaic from every frame in `frames` that carries a TAN WCS.
+/// The first such frame's WCS (CRVAL + CD matrix) is reused verbatim as the
+/// output projection so pixel scale, orientation, and projection centre stay
+/// the same. The output canvas is sized to the bounding box of all input
+/// frames' corners in that reference WCS, and CRPIX is shifted so output
+/// pixel (1, 1) maps to the bbox start.
+///
+/// Sampling is nearest-neighbour; overlapping pixels are averaged. Returns
+/// `None` if fewer than two frames have a WCS, or if the resulting canvas
+/// would exceed `MAX_MOSAIC_PX` pixels.
+fn build_mosaic(frames: &[Frame]) -> Result<FitsImage, String> {
+    const MAX_MOSAIC_PX: usize = 64_000_000; // ~256 MiB at f32, sanity cap.
+
+    let with_wcs: Vec<&Frame> = frames.iter().filter(|f| f.fits.wcs.is_some()).collect();
+    if with_wcs.len() < 2 {
+        return Err("mosaic: need at least 2 frames with WCS".into());
+    }
+    let ref_wcs = with_wcs[0].fits.wcs.as_ref().unwrap();
+
+    // Project every frame's 4 corners (1-based) → world → ref-WCS pixel.
+    // CRPIX of the *temporary* reference is its own CRPIX; we'll shift after
+    // we know the bbox.
+    let mut min_x = f64::INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    for f in &with_wcs {
+        let w = f.fits.width  as f64;
+        let h = f.fits.height as f64;
+        let corners = [(1.0, 1.0), (w, 1.0), (1.0, h), (w, h)];
+        let fw = f.fits.wcs.as_ref().unwrap();
+        for (x, y) in corners {
+            let (ra, dec) = fw.pix_to_world(x, y);
+            if let Some((rx, ry)) = ref_wcs.world_to_pix(ra, dec) {
+                if rx.is_finite() && ry.is_finite() {
+                    min_x = min_x.min(rx);
+                    min_y = min_y.min(ry);
+                    max_x = max_x.max(rx);
+                    max_y = max_y.max(ry);
+                }
+            }
+        }
+    }
+    if !(min_x.is_finite() && max_x.is_finite()) {
+        return Err("mosaic: could not project any corner — check WCS".into());
+    }
+    let out_w = ((max_x - min_x).ceil() as usize).saturating_add(1).max(1);
+    let out_h = ((max_y - min_y).ceil() as usize).saturating_add(1).max(1);
+    let total = out_w.checked_mul(out_h).ok_or("mosaic: overflow")?;
+    if total > MAX_MOSAIC_PX {
+        return Err(format!(
+            "mosaic: output {out_w}×{out_h} = {total} px exceeds cap ({MAX_MOSAIC_PX})"
+        ));
+    }
+
+    // Output WCS = ref WCS with CRPIX shifted so that output pixel (1,1) maps
+    // to ref-WCS pixel (min_x, min_y).
+    let mut out_wcs = ref_wcs.clone();
+    out_wcs.crpix1 = ref_wcs.crpix1 - min_x + 1.0;
+    out_wcs.crpix2 = ref_wcs.crpix2 - min_y + 1.0;
+
+    let mut sum   = vec![0.0_f64; total];
+    let mut count = vec![0_u32;   total];
+
+    for f in &with_wcs {
+        let fw = f.fits.wcs.as_ref().unwrap();
+        let fw_w = f.fits.width  as i64;
+        let fw_h = f.fits.height as i64;
+        for oy in 0..out_h {
+            for ox in 0..out_w {
+                // 1-based output pixel
+                let (ra, dec) = out_wcs.pix_to_world(ox as f64 + 1.0, oy as f64 + 1.0);
+                let Some((fx, fy)) = fw.world_to_pix(ra, dec) else { continue };
+                if !(fx.is_finite() && fy.is_finite()) { continue }
+                // 1-based → 0-based nearest-neighbour
+                let ix = fx.round() as i64 - 1;
+                let iy = fy.round() as i64 - 1;
+                if ix < 0 || iy < 0 || ix >= fw_w || iy >= fw_h { continue }
+                let v = f.fits.data[(iy as usize) * (fw_w as usize) + ix as usize];
+                if !v.is_finite() { continue }
+                let oi = oy * out_w + ox;
+                sum[oi]   += v as f64;
+                count[oi] += 1;
+            }
+        }
+    }
+
+    let mut data = vec![f32::NAN; total];
+    let mut mn = f32::INFINITY;
+    let mut mx = f32::NEG_INFINITY;
+    for i in 0..total {
+        if count[i] > 0 {
+            let v = (sum[i] / count[i] as f64) as f32;
+            data[i] = v;
+            if v < mn { mn = v; }
+            if v > mx { mx = v; }
+        }
+    }
+    if !mn.is_finite() { mn = 0.0; mx = 1.0; }
+
+    Ok(FitsImage {
+        width:  out_w,
+        height: out_h,
+        data,
+        min: mn,
+        max: mx,
+        wcs: Some(out_wcs),
+    })
+}
+
 // ---------------------------------------------------------------- export --
 
 /// Save the active frame's rendered RGBA as a PNG.
@@ -2565,6 +2677,25 @@ fn handle_menu(window: &MainWindow, st: &mut State, menu: &str, item: &str) {
                 }
             }
         }
+        ("Frame", "Mosaic WCS") => {
+            match build_mosaic(&st.frames) {
+                Ok(img) => {
+                    let (w, h, n_in) = (img.width, img.height,
+                        st.frames.iter().filter(|f| f.fits.wcs.is_some()).count());
+                    save_view_into_active(window, st);
+                    let mut fr = Frame::new(img, format!("mosaic ({n_in} frames)"));
+                    apply_prefs_to_frame(&st.prefs, &mut fr);
+                    st.frames.push(fr);
+                    st.active = st.frames.len() - 1;
+                    push_view_to_window(window, st);
+                    refresh_view(window, st);
+                    window.set_status_text(format!(
+                        "mosaic: {n_in} frames → {w}×{h}    [frame {}]", st.active + 1
+                    ).into());
+                }
+                Err(e) => window.set_status_text(e.into()),
+            }
+        }
 
         // Scale — stretch / limits live on the active frame
         ("Scale", "linear")  => { if let Some(f) = st.active_frame_mut() { f.stretch = Stretch::Linear;  } refresh_view(window, st); }
@@ -3020,6 +3151,7 @@ fn dispatch_ipc(window: &MainWindow, st: &mut State, line: &str) -> String {
     let toks: Vec<&str> = line.splitn(3, ' ').collect();
     match toks.as_slice() {
         ["quit"] => { let _ = slint::quit_event_loop(); "ok".into() }
+        ["frame", "mosaic"]    => { handle_menu(window, st, "Frame", "Mosaic WCS"); "ok".into() }
         ["frame", "next"]      => { handle_menu(window, st, "Frame", "Next"); "ok".into() }
         ["frame", "previous"]  => { handle_menu(window, st, "Frame", "Previous"); "ok".into() }
         ["frame", n] => {
@@ -3106,7 +3238,7 @@ fn dispatch_ipc(window: &MainWindow, st: &mut State, line: &str) -> String {
                 } else { "err out of bounds".into() }
             } else { "err no frame".into() }
         }
-        ["help"] => "commands: quit | frame next|previous|N | scale S | cmap C | bin N | zoom in|out|fit|N | region load|save P | file open P | save png|fits P | value | sextractor | crop [reset] | projection | centroid | radial | hdu next|list|N | movie on|off | help".into(),
+        ["help"] => "commands: quit | frame next|previous|N|mosaic | scale S | cmap C | bin N | zoom in|out|fit|N | region load|save P | file open P | save png|fits P | value | sextractor | crop [reset] | projection | centroid | radial | hdu next|list|N | movie on|off | help".into(),
         _ => format!("err unknown: {line}"),
     }
 }
