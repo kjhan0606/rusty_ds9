@@ -38,6 +38,32 @@ impl SmoothKind {
     }
 }
 
+/// 3-D cube projection mode for `Frame::cube_mode`. `Slice(k)` shows the
+/// k-th plane (0-based); `MaxIntensity` / `Sum` / `Mean` collapse all planes
+/// pixel-wise into the 2-D `fits.data` view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CubeMode {
+    Slice(usize),
+    MaxIntensity,
+    Sum,
+    Mean,
+}
+
+impl Default for CubeMode {
+    fn default() -> Self { CubeMode::Slice(0) }
+}
+
+impl CubeMode {
+    fn label(self) -> String {
+        match self {
+            CubeMode::Slice(k)     => format!("slice {}", k + 1),
+            CubeMode::MaxIntensity => "max-intensity".into(),
+            CubeMode::Sum          => "sum".into(),
+            CubeMode::Mean         => "mean".into(),
+        }
+    }
+}
+
 /// Block-bin reduction mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum BinMode {
@@ -108,6 +134,9 @@ struct Frame {
     /// Used by the HDU navigator dialog so we can re-load a different HDU
     /// without the user having to re-pick the file.
     hdu_idx: usize,
+    /// 3-D cube projection mode. Has no effect when `fits.cube` is `None`
+    /// (regular 2-D image). On change, `apply_cube_mode` rewrites `fits.data`.
+    cube_mode: CubeMode,
 }
 
 impl Frame {
@@ -134,6 +163,7 @@ impl Frame {
             orientation: Orientation::Identity,
             custom_lut: None,
             hdu_idx: 0,
+            cube_mode: CubeMode::default(),
         }
     }
 
@@ -2218,7 +2248,76 @@ fn build_mosaic(frames: &[Frame]) -> Result<FitsImage, String> {
         min: mn,
         max: mx,
         wcs: Some(out_wcs),
+        cube: None,
     })
+}
+
+// ----------------------------------------------------- 3-D cube rendering --
+
+/// Re-derive `f.fits.data` (and finite min/max) from `f.fits.cube` according
+/// to the current `f.cube_mode`. No-op when the frame has no cube payload.
+/// NaN values are skipped pixel-wise so a partial NaN plane doesn't poison
+/// the whole projection.
+fn apply_cube_mode(f: &mut Frame) {
+    let Some(cube) = f.fits.cube.clone() else { return };
+    let w = f.fits.width;
+    let h = f.fits.height;
+    let plane = w * h;
+    if plane == 0 || cube.depth == 0 { return; }
+
+    let mut out = vec![f32::NAN; plane];
+    match f.cube_mode {
+        CubeMode::Slice(k) => {
+            let k = k.min(cube.depth - 1);
+            let off = k * plane;
+            out.copy_from_slice(&cube.data[off..off + plane]);
+        }
+        CubeMode::MaxIntensity => {
+            for i in 0..plane {
+                let mut best = f32::NEG_INFINITY;
+                for k in 0..cube.depth {
+                    let v = cube.data[k * plane + i];
+                    if v.is_finite() && v > best { best = v; }
+                }
+                if best.is_finite() { out[i] = best; }
+            }
+        }
+        CubeMode::Sum => {
+            for i in 0..plane {
+                let mut s = 0.0_f64;
+                let mut any = false;
+                for k in 0..cube.depth {
+                    let v = cube.data[k * plane + i];
+                    if v.is_finite() { s += v as f64; any = true; }
+                }
+                if any { out[i] = s as f32; }
+            }
+        }
+        CubeMode::Mean => {
+            for i in 0..plane {
+                let mut s = 0.0_f64;
+                let mut n = 0_u32;
+                for k in 0..cube.depth {
+                    let v = cube.data[k * plane + i];
+                    if v.is_finite() { s += v as f64; n += 1; }
+                }
+                if n > 0 { out[i] = (s / n as f64) as f32; }
+            }
+        }
+    }
+
+    let mut mn = f32::INFINITY;
+    let mut mx = f32::NEG_INFINITY;
+    for &v in &out {
+        if v.is_finite() {
+            if v < mn { mn = v; }
+            if v > mx { mx = v; }
+        }
+    }
+    if !mn.is_finite() { mn = 0.0; mx = 1.0; }
+    f.fits.data = out;
+    f.fits.min  = mn;
+    f.fits.max  = mx;
 }
 
 // ---------------------------------------------------------------- export --
@@ -3297,6 +3396,31 @@ fn handle_menu(window: &MainWindow, st: &mut State, menu: &str, item: &str) {
                 );
             }
         }
+        ("Frame", "3D Slice…")
+        | ("Frame", "3D Max Intensity")
+        | ("Frame", "3D Sum")
+        | ("Frame", "3D Mean") => {
+            let Some(f) = st.active_frame_mut() else {
+                window.set_status_text("3D: no active frame".into()); return;
+            };
+            let Some(cube) = f.fits.cube.as_ref() else {
+                window.set_status_text("3D: active frame is not a NAXIS=3 cube".into()); return;
+            };
+            let depth = cube.depth;
+            f.cube_mode = match item {
+                "3D Max Intensity" => CubeMode::MaxIntensity,
+                "3D Sum"           => CubeMode::Sum,
+                "3D Mean"          => CubeMode::Mean,
+                _ /* "3D Slice…" */ => match f.cube_mode {
+                    CubeMode::Slice(k) => CubeMode::Slice((k + 1) % depth),
+                    _ => CubeMode::Slice(0),
+                },
+            };
+            let label = f.cube_mode.label();
+            apply_cube_mode(f);
+            refresh_view(window, st);
+            window.set_status_text(format!("3D: {label} (depth = {depth})").into());
+        }
         ("Frame", "Mosaic WCS") => {
             match build_mosaic(&st.frames) {
                 Ok(img) => {
@@ -3787,6 +3911,24 @@ fn dispatch_ipc(window: &MainWindow, st: &mut State, line: &str) -> String {
         }
         ["frame", "mosaic"]    => { handle_menu(window, st, "Frame", "Mosaic WCS"); "ok".into() }
         ["frame", "tile"]      => { handle_menu(window, st, "Frame", "Tile Frames"); "ok".into() }
+        ["3d", "max"]          => { handle_menu(window, st, "Frame", "3D Max Intensity"); "ok".into() }
+        ["3d", "sum"]          => { handle_menu(window, st, "Frame", "3D Sum"); "ok".into() }
+        ["3d", "mean"]         => { handle_menu(window, st, "Frame", "3D Mean"); "ok".into() }
+        ["3d", "slice", n] => {
+            let Some(f) = st.active_frame_mut() else { return "err: no active frame".into() };
+            let Some(cube) = f.fits.cube.as_ref() else { return "err: not a cube".into() };
+            let depth = cube.depth;
+            let k: usize = match n.parse() { Ok(v) => v, Err(_) => return "err: slice index".into() };
+            if k == 0 || k > depth { return format!("err: slice 1..{depth}").into() }
+            f.cube_mode = CubeMode::Slice(k - 1);
+            apply_cube_mode(f);
+            refresh_view(window, st);
+            format!("ok: slice {k}/{depth}").into()
+        }
+        ["3d", "depth"] => {
+            let Some(f) = st.active_frame() else { return "0".into() };
+            f.fits.cube.as_ref().map(|c| c.depth.to_string()).unwrap_or_else(|| "0".into())
+        }
         ["frame", "new"]       => { handle_menu(window, st, "Frame", "New Frame"); "ok".into() }
         ["frame", "delete"]    => { handle_menu(window, st, "Frame", "Delete Frame"); "ok".into() }
         ["frame", "clear"]     => {
@@ -3996,7 +4138,8 @@ fn dispatch_ipc(window: &MainWindow, st: &mut State, line: &str) -> String {
             file open P | save png|fits P | value | sextractor | \
             samp image|votable | \
             crop [reset] | projection | centroid | radial | \
-            hdu next|list|N | movie on|off | help".into(),
+            hdu next|list|N | movie on|off | \
+            3d max|sum|mean|slice N | 3d depth | help".into(),
         _ => format!("err unknown: {line}"),
     }
 }
@@ -4044,7 +4187,13 @@ where S: std::io::Read + std::io::Write + Send + 'static + TryCloneStream<Cloned
             let resp = if let Some(w) = weak.upgrade() {
                 STATE_FOR_IPC.with(|c| {
                     if let Some(st) = c.borrow().as_ref() {
-                        dispatch_ipc(&w, &mut st.borrow_mut(), &cmd)
+                        // Silently bail if a UI handler holds the State borrow
+                        // (e.g. a modal native dialog is open and pumping the
+                        // event loop). The client will see `err busy`.
+                        match st.try_borrow_mut() {
+                            Ok(mut s) => dispatch_ipc(&w, &mut s, &cmd),
+                            Err(_) => "err busy".into(),
+                        }
                     } else { "err state unavailable".into() }
                 })
             } else { "err window gone".into() };
@@ -4200,6 +4349,9 @@ fn main() -> Result<()> {
         let state = Rc::clone(&state);
         win.on_canvas_mouse_move(move |x, y| {
             let Some(w) = weak.upgrade() else { return };
+            // Re-entrance guard: if a native dialog is open, State is mut-borrowed
+            // by the menu handler — drop the stray pointer event silently.
+            if state.try_borrow_mut().is_err() { return; }
 
             // ----- marker drag (edit mode only) -----
             {
@@ -4258,6 +4410,8 @@ fn main() -> Result<()> {
         let state = Rc::clone(&state);
         win.on_canvas_clicked(move |x, y| {
             let Some(w) = weak.upgrade() else { return };
+            // Re-entrance guard (modal dialog open).
+            if state.try_borrow_mut().is_err() { return; }
             // Tile mode: click a cell to select that frame and exit tile.
             {
                 let mut s = state.borrow_mut();
@@ -4331,6 +4485,7 @@ fn main() -> Result<()> {
         let state = Rc::clone(&state);
         win.on_catalog_row_activated(move |idx| {
             let Some(w) = weak.upgrade() else { return };
+            if state.try_borrow_mut().is_err() { return; }
             let idx = idx as usize;
             let mut s = state.borrow_mut();
             // Re-derive the (x, y) for that row from the catalog itself so we
@@ -4358,6 +4513,7 @@ fn main() -> Result<()> {
         let state = Rc::clone(&state);
         win.on_canvas_pressed(move |x, y| {
             let Some(w) = weak.upgrade() else { return };
+            if state.try_borrow_mut().is_err() { return; }
             let mut s = state.borrow_mut();
             let xy_hit = s.active_frame().map(|f| {
                 let (fx, fy) = display_to_fits(x as f64, y as f64, f);
@@ -4396,6 +4552,7 @@ fn main() -> Result<()> {
         let state = Rc::clone(&state);
         win.on_canvas_released(move || {
             let Some(w) = weak.upgrade() else { return };
+            if state.try_borrow_mut().is_err() { return; }
             let mut s = state.borrow_mut();
             s.dragging_marker = None;
             s.last_drag_fits = None;
@@ -4434,6 +4591,7 @@ fn main() -> Result<()> {
             move || {
                 let Some(w) = weak.upgrade() else { return };
                 if !w.get_blink_active() { return; }
+                if state.try_borrow_mut().is_err() { return; }
                 let mut s = state.borrow_mut();
                 if s.frames.len() < 2 { return; }
                 let n = s.frames.len();
@@ -4455,6 +4613,7 @@ fn main() -> Result<()> {
             move || {
                 let Some(w) = weak.upgrade() else { return };
                 if !w.get_hdu_movie_active() { return; }
+                if state.try_borrow_mut().is_err() { return; }
                 advance_hdu(&w, &mut state.borrow_mut());
             },
         );

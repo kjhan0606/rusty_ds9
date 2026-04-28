@@ -426,7 +426,7 @@ pub fn smooth_gaussian(img: &FitsImage, sigma: f32) -> FitsImage {
         }
     }
     let (min, max) = finite_minmax(&out);
-    FitsImage { width: w, height: h, data: out, min, max, wcs: img.wcs.clone() }
+    FitsImage { width: w, height: h, data: out, min, max, wcs: img.wcs.clone(), cube: None }
 }
 
 /// Boxcar smoothing — equivalent to a uniform mean filter over an `n × n`
@@ -468,7 +468,7 @@ pub fn smooth_boxcar(img: &FitsImage, n: u32) -> FitsImage {
         }
     }
     let (min, max) = finite_minmax(&out);
-    FitsImage { width: w, height: h, data: out, min, max, wcs: img.wcs.clone() }
+    FitsImage { width: w, height: h, data: out, min, max, wcs: img.wcs.clone(), cube: None }
 }
 
 /// Median smoothing over an `n × n` window. Not separable, but `n` is
@@ -501,7 +501,7 @@ pub fn smooth_median(img: &FitsImage, n: u32) -> FitsImage {
         }
     }
     let (min, max) = finite_minmax(&out);
-    FitsImage { width: w, height: h, data: out, min, max, wcs: img.wcs.clone() }
+    FitsImage { width: w, height: h, data: out, min, max, wcs: img.wcs.clone(), cube: None }
 }
 
 /// Block-average bin a factor `n` across both axes, then expand back so the
@@ -540,7 +540,7 @@ pub fn bin_average(img: &FitsImage, n: u32) -> FitsImage {
         }
     }
     let (min, max) = finite_minmax(&out);
-    FitsImage { width: w, height: h, data: out, min, max, wcs: img.wcs.clone() }
+    FitsImage { width: w, height: h, data: out, min, max, wcs: img.wcs.clone(), cube: None }
 }
 
 /// Block-sum bin: same expansion as `bin_average` but each block holds the
@@ -572,7 +572,7 @@ pub fn bin_sum(img: &FitsImage, n: u32) -> FitsImage {
         }
     }
     let (min, max) = finite_minmax(&out);
-    FitsImage { width: w, height: h, data: out, min, max, wcs: img.wcs.clone() }
+    FitsImage { width: w, height: h, data: out, min, max, wcs: img.wcs.clone(), cube: None }
 }
 
 /// Sub-sample bin: take the value at the top-left of each NxN block and
@@ -597,7 +597,7 @@ pub fn bin_subsample(img: &FitsImage, n: u32) -> FitsImage {
         }
     }
     let (min, max) = finite_minmax(&out);
-    FitsImage { width: w, height: h, data: out, min, max, wcs: img.wcs.clone() }
+    FitsImage { width: w, height: h, data: out, min, max, wcs: img.wcs.clone(), cube: None }
 }
 
 fn clone_image(img: &FitsImage) -> FitsImage {
@@ -608,6 +608,7 @@ fn clone_image(img: &FitsImage) -> FitsImage {
         min: img.min,
         max: img.max,
         wcs: img.wcs.clone(),
+        cube: None,
     }
 }
 

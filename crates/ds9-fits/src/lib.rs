@@ -29,6 +29,18 @@ pub struct FitsImage {
     pub min: f32,
     pub max: f32,
     pub wcs: Option<Wcs>,
+    /// Optional NAXIS=3 cube data (full w*h*depth f32 raster, plane-major).
+    /// Populated only when the loaded HDU had NAXIS3 > 1; otherwise `None`.
+    /// `data` always holds a 2-D view (the first plane by default).
+    pub cube: Option<Cube3D>,
+}
+
+/// 3-D cube payload kept alongside the 2-D `FitsImage::data` view.
+#[derive(Clone)]
+pub struct Cube3D {
+    pub depth: usize,
+    /// Flattened plane-major: `data[(k*h + y)*w + x]` for slice k, row y, col x.
+    pub data: Vec<f32>,
 }
 
 // ----------------------------------------------------------------- WCS --
@@ -315,7 +327,23 @@ where
     };
     let (min, max) = finite_minmax(&raster);
     let wcs = try_parse_wcs(header);
-    Some(FitsImage { width: znaxis1, height: znaxis2, data: raster, min, max, wcs })
+    Some(FitsImage { width: znaxis1, height: znaxis2, data: raster, min, max, wcs, cube: None })
+}
+
+/// Read the full NAXIS=3 cube (or just the 2-D plane when depth == 1) and
+/// return `(first_plane, cube_opt)`. `first_plane` is always w*h pixels;
+/// `cube_opt` is `Some(Cube3D)` only when depth > 1.
+fn read_planes<R: std::io::Read + std::io::BufRead + std::io::Seek>(
+    image: fitsrs::ImageData<R>, w: usize, h: usize, depth: usize,
+) -> (Vec<f32>, Option<Cube3D>) {
+    let plane = w.saturating_mul(h);
+    let total = plane.saturating_mul(depth.max(1));
+    let raw = pixels_to_f32(image, total);
+    if depth <= 1 {
+        return (raw, None);
+    }
+    let first = raw[..plane].to_vec();
+    (first, Some(Cube3D { depth, data: raw }))
 }
 
 // ------------------------------------------------------------------ load --
@@ -413,11 +441,11 @@ pub fn load_hdu<P: AsRef<Path>>(path: P, target_idx: usize) -> Result<FitsImage,
                 }
                 let w = naxis[0] as usize;
                 let h = naxis[1] as usize;
-                let plane = w.saturating_mul(h);
+                let depth = if naxis.len() >= 3 { naxis[2] as usize } else { 1 };
                 let wcs = try_parse_wcs(p.get_header());
-                let data = pixels_to_f32(hdus.get_data(&p), plane);
+                let (data, cube) = read_planes(hdus.get_data(&p), w, h, depth);
                 let (min, max) = finite_minmax(&data);
-                return Ok(FitsImage { width: w, height: h, data, min, max, wcs });
+                return Ok(FitsImage { width: w, height: h, data, min, max, wcs, cube });
             }
             HDU::XImage(x) => {
                 let naxis: Vec<u64> = x.get_header().get_xtension().get_naxis().to_vec();
@@ -426,11 +454,11 @@ pub fn load_hdu<P: AsRef<Path>>(path: P, target_idx: usize) -> Result<FitsImage,
                 }
                 let w = naxis[0] as usize;
                 let h = naxis[1] as usize;
-                let plane = w.saturating_mul(h);
+                let depth = if naxis.len() >= 3 { naxis[2] as usize } else { 1 };
                 let wcs = try_parse_wcs(x.get_header());
-                let data = pixels_to_f32(hdus.get_data(&x), plane);
+                let (data, cube) = read_planes(hdus.get_data(&x), w, h, depth);
                 let (min, max) = finite_minmax(&data);
-                return Ok(FitsImage { width: w, height: h, data, min, max, wcs });
+                return Ok(FitsImage { width: w, height: h, data, min, max, wcs, cube });
             }
             HDU::XBinaryTable(b) => {
                 if b.get_header().get_xtension().get_z_image().is_none() {
@@ -465,11 +493,11 @@ pub fn load<P: AsRef<Path>>(path: P) -> Result<FitsImage, FitsError> {
                 }
                 let w = naxis[0] as usize;
                 let h = naxis[1] as usize;
-                let plane = w.saturating_mul(h);
+                let depth = if naxis.len() >= 3 { naxis[2] as usize } else { 1 };
                 let wcs = try_parse_wcs(p.get_header());
-                let data = pixels_to_f32(hdus.get_data(&p), plane);
+                let (data, cube) = read_planes(hdus.get_data(&p), w, h, depth);
                 let (min, max) = finite_minmax(&data);
-                return Ok(FitsImage { width: w, height: h, data, min, max, wcs });
+                return Ok(FitsImage { width: w, height: h, data, min, max, wcs, cube });
             }
             HDU::XImage(x) => {
                 let naxis: Vec<u64> = x.get_header().get_xtension().get_naxis().to_vec();
@@ -478,11 +506,11 @@ pub fn load<P: AsRef<Path>>(path: P) -> Result<FitsImage, FitsError> {
                 }
                 let w = naxis[0] as usize;
                 let h = naxis[1] as usize;
-                let plane = w.saturating_mul(h);
+                let depth = if naxis.len() >= 3 { naxis[2] as usize } else { 1 };
                 let wcs = try_parse_wcs(x.get_header());
-                let data = pixels_to_f32(hdus.get_data(&x), plane);
+                let (data, cube) = read_planes(hdus.get_data(&x), w, h, depth);
                 let (min, max) = finite_minmax(&data);
-                return Ok(FitsImage { width: w, height: h, data, min, max, wcs });
+                return Ok(FitsImage { width: w, height: h, data, min, max, wcs, cube });
             }
             HDU::XBinaryTable(b) => {
                 if b.get_header().get_xtension().get_z_image().is_none() {
