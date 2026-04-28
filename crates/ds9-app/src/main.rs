@@ -1722,6 +1722,118 @@ fn hex_nib(n: u8) -> u8 {
     if n < 10 { b'0' + n } else { b'a' + (n - 10) }
 }
 
+// ---------------------------------------------------------------- HDU --
+
+/// True for HDU kinds whose data we can render as an image.
+fn is_loadable_hdu(kind: &str) -> bool {
+    matches!(kind, "PRIMARY" | "IMAGE" | "TILE-COMPRESSED")
+}
+
+/// Enumerate the HDUs of the active frame's source file and push them into the
+/// `hdu-rows` slint model. Returns the source path on success, or an error
+/// message on failure (no source file, no HDUs, parse error).
+fn populate_hdu_panel(window: &MainWindow, st: &State) -> Result<(), String> {
+    let active = st.active_frame().ok_or("HDU navigator: no active frame")?;
+    let path = active.source_path.clone()
+        .ok_or("HDU navigator: active frame is synthetic (no source file)")?;
+    let cur_idx = active.hdu_idx;
+    let hdus = ds9_fits::enumerate_hdus(&path)
+        .map_err(|e| format!("HDU navigator: {e}"))?;
+    if hdus.is_empty() { return Err("HDU navigator: file has no HDUs".into()); }
+
+    let rows: Vec<HduRow> = hdus.iter().map(|h| {
+        let dims = match h.dims {
+            Some((w, h_)) => format!(" {w}×{h_}"),
+            None => String::new(),
+        };
+        let label = format!("[{:>2}] {:<16} {}{dims}", h.idx, h.kind, h.name);
+        HduRow {
+            idx: h.idx as i32,
+            label: label.into(),
+            loadable: is_loadable_hdu(h.kind),
+            active: h.idx == cur_idx,
+        }
+    }).collect();
+
+    window.set_hdu_rows(ModelRc::new(VecModel::from(rows)));
+    let label = path.file_name().and_then(|s| s.to_str()).unwrap_or("(fits)");
+    window.set_hdu_source_name(format!("({})", label).into());
+    Ok(())
+}
+
+/// Replace the active frame's image with `path`'s `target_idx` HDU. Updates
+/// the panel's row state and refreshes the view.
+fn load_hdu_into_active(window: &MainWindow, st: &mut State, target_idx: usize) {
+    let Some(path) = st.active_frame().and_then(|f| f.source_path.clone()) else {
+        window.set_status_text("HDU load: no source path".into()); return;
+    };
+    let info = match ds9_fits::enumerate_hdus(&path) {
+        Ok(v) => v,
+        Err(e) => { window.set_status_text(format!("HDU load: {e}").into()); return; }
+    };
+    let Some(meta) = info.into_iter().find(|h| h.idx == target_idx) else {
+        window.set_status_text(format!("HDU load: no HDU [{target_idx}]").into()); return;
+    };
+    if !is_loadable_hdu(meta.kind) {
+        window.set_status_text(format!("HDU [{target_idx}] is {} (not loadable)", meta.kind).into());
+        return;
+    }
+    match ds9_fits::load_hdu(&path, target_idx) {
+        Ok(img) => {
+            let (w, h) = (img.width, img.height);
+            save_view_into_active(window, st);
+            if let Some(f) = st.active_frame_mut() {
+                let new_name = format!("{}[{}]",
+                    path.file_name().and_then(|s| s.to_str()).unwrap_or("(fits)"),
+                    meta.name);
+                f.fits = img;
+                f.name = new_name;
+                f.hdu_idx = target_idx;
+                f.view_zoom = fit_zoom(w, h);
+                f.view_pan_x = 0.0;
+                f.view_pan_y = 0.0;
+            }
+            push_view_to_window(window, st);
+            refresh_view(window, st);
+            // refresh the panel so the active row marker moves
+            if window.get_hdu_panel_visible() {
+                let _ = populate_hdu_panel(window, st);
+            }
+            window.set_status_text(format!(
+                "HDU [{target_idx}] {} {} ({w}×{h})", meta.kind, meta.name,
+            ).into());
+        }
+        Err(e) => window.set_status_text(format!("HDU load: {e}").into()),
+    }
+}
+
+/// Find the next loadable HDU after the active frame's current HDU and load
+/// it (wrapping). No-op if the file has no other loadable HDUs.
+fn advance_hdu(window: &MainWindow, st: &mut State) {
+    let Some(active) = st.active_frame() else {
+        window.set_status_text("HDU: no active frame".into()); return;
+    };
+    let Some(path) = active.source_path.clone() else {
+        window.set_status_text("HDU: active frame is synthetic".into()); return;
+    };
+    let cur_idx = active.hdu_idx;
+    let hdus = match ds9_fits::enumerate_hdus(&path) {
+        Ok(v) => v,
+        Err(e) => { window.set_status_text(format!("HDU: {e}").into()); return; }
+    };
+    let total = hdus.len();
+    if total == 0 { window.set_status_text("HDU: file has no HDUs".into()); return; }
+    let mut chosen: Option<usize> = None;
+    for k in 1..=total {
+        let i = (cur_idx + k) % total;
+        if is_loadable_hdu(hdus[i].kind) { chosen = Some(i); break; }
+    }
+    let Some(target) = chosen else {
+        window.set_status_text("HDU: no other loadable HDUs".into()); return;
+    };
+    load_hdu_into_active(window, st, target);
+}
+
 // ---------------------------------------------------------------- menus --
 
 fn handle_menu(window: &MainWindow, st: &mut State, menu: &str, item: &str) {
@@ -1770,69 +1882,21 @@ fn handle_menu(window: &MainWindow, st: &mut State, menu: &str, item: &str) {
             }
         }
         ("File", "HDU Navigator…") => {
-            let Some(active) = st.active_frame() else {
-                window.set_status_text("HDU navigator: no active frame".into()); return;
-            };
-            let Some(path) = active.source_path.clone() else {
-                window.set_status_text(
-                    "HDU navigator: active frame is synthetic (no source file)".into()
-                );
-                return;
-            };
-            let cur_idx = active.hdu_idx;
-            match ds9_fits::enumerate_hdus(&path) {
-                Ok(hdus) if !hdus.is_empty() => {
-                    // pick the next loadable HDU (an image / tile-compressed) after the current one,
-                    // wrapping around. If none are loadable, just bail with an info message.
-                    let total = hdus.len();
-                    let mut chosen: Option<usize> = None;
-                    for k in 1..=total {
-                        let try_idx = (cur_idx + k) % total;
-                        let kind = hdus[try_idx].kind;
-                        if kind == "PRIMARY" || kind == "IMAGE" || kind == "TILE-COMPRESSED" {
-                            chosen = Some(try_idx);
-                            break;
-                        }
+            // Toggle the panel; populate when opening.
+            if window.get_hdu_panel_visible() {
+                window.set_hdu_panel_visible(false);
+                window.set_status_text("HDU navigator: hidden".into());
+            } else {
+                match populate_hdu_panel(window, st) {
+                    Ok(()) => {
+                        window.set_hdu_panel_visible(true);
+                        window.set_status_text("HDU navigator: shown".into());
                     }
-                    let Some(target) = chosen else {
-                        let listing = hdus.iter().map(|h|
-                            format!("  [{}] {} {}", h.idx, h.kind, h.name)
-                        ).collect::<Vec<_>>().join(" │ ");
-                        window.set_status_text(
-                            format!("HDU navigator: no image HDUs in {} ({total} total): {listing}", path.display()).into()
-                        );
-                        return;
-                    };
-                    match ds9_fits::load_hdu(&path, target) {
-                        Ok(img) => {
-                            let (w, h) = (img.width, img.height);
-                            let info = &hdus[target];
-                            save_view_into_active(window, st);
-                            if let Some(f) = st.active_frame_mut() {
-                                let new_name = format!("{}[{}]",
-                                    path.file_name().and_then(|s| s.to_str()).unwrap_or("(fits)"),
-                                    info.name);
-                                f.fits = img;
-                                f.name = new_name;
-                                f.hdu_idx = target;
-                                f.view_zoom = fit_zoom(w, h);
-                                f.view_pan_x = 0.0;
-                                f.view_pan_y = 0.0;
-                            }
-                            push_view_to_window(window, st);
-                            refresh_view(window, st);
-                            window.set_status_text(format!(
-                                "HDU [{target}] {} {} ({w}×{h})",
-                                info.kind, info.name,
-                            ).into());
-                        }
-                        Err(e) => window.set_status_text(format!("HDU load: {e}").into()),
-                    }
+                    Err(msg) => window.set_status_text(msg.into()),
                 }
-                Ok(_) => window.set_status_text("HDU navigator: file has no HDUs".into()),
-                Err(e) => window.set_status_text(format!("HDU navigator: {e}").into()),
             }
         }
+        ("File", "Next HDU") => { advance_hdu(window, st); }
         ("File", "Print…") => {
             // Spawn a print pipeline by saving a PNG to a temp path and
             // shelling out to `lpr`. If lpr isn't on PATH, fall back to
@@ -1968,6 +2032,14 @@ fn handle_menu(window: &MainWindow, st: &mut State, menu: &str, item: &str) {
             window.set_status_text(
                 if next { "blink: on (cycling every 500 ms)".into() }
                 else    { "blink: off".into() }
+            );
+        }
+        ("Frame", "HDU Movie") => {
+            let next = !window.get_hdu_movie_active();
+            window.set_hdu_movie_active(next);
+            window.set_status_text(
+                if next { "HDU movie: on (cycling every 800 ms)".into() }
+                else    { "HDU movie: off".into() }
             );
         }
         ("Frame", "Rotate 180°") | ("Frame", "Flip Horizontal") | ("Frame", "Flip Vertical")
@@ -2453,6 +2525,24 @@ fn dispatch_ipc(window: &MainWindow, st: &mut State, line: &str) -> String {
         ["crop"]       => { handle_menu(window, st, "Edit", "Crop to Selected"); "ok".into() }
         ["crop", "reset"] => { handle_menu(window, st, "Edit", "Reset Crop"); "ok".into() }
         ["projection"] => { handle_menu(window, st, "Region", "Projection…"); "ok".into() }
+        ["hdu", "next"]   => { advance_hdu(window, st); "ok".into() }
+        ["hdu", "list"]   => {
+            let Some(p) = st.active_frame().and_then(|f| f.source_path.clone())
+                else { return "err no source path".into() };
+            match ds9_fits::enumerate_hdus(&p) {
+                Ok(v) => v.iter().map(|h| format!("{} {} {}", h.idx, h.kind, h.name))
+                    .collect::<Vec<_>>().join("\n"),
+                Err(e) => format!("err {e}"),
+            }
+        }
+        ["hdu", n] => {
+            match n.parse::<usize>() {
+                Ok(i) => { load_hdu_into_active(window, st, i); "ok".into() }
+                Err(_) => "err: hdu N | hdu next | hdu list".into(),
+            }
+        }
+        ["movie", "on"]   => { window.set_hdu_movie_active(true);  "ok".into() }
+        ["movie", "off"]  => { window.set_hdu_movie_active(false); "ok".into() }
         ["value"] => {
             let cx = window.get_cursor_image_x() as i32;
             let cy = window.get_cursor_image_y() as i32;
@@ -2464,7 +2554,7 @@ fn dispatch_ipc(window: &MainWindow, st: &mut State, line: &str) -> String {
                 } else { "err out of bounds".into() }
             } else { "err no frame".into() }
         }
-        ["help"] => "commands: quit | frame next|previous|N | scale S | cmap C | bin N | zoom in|out|fit|N | region load|save P | file open P | save png|fits P | value | sextractor | crop [reset] | projection | help".into(),
+        ["help"] => "commands: quit | frame next|previous|N | scale S | cmap C | bin N | zoom in|out|fit|N | region load|save P | file open P | save png|fits P | value | sextractor | crop [reset] | projection | hdu next|list|N | movie on|off | help".into(),
         _ => format!("err unknown: {line}"),
     }
 }
@@ -2830,6 +2920,34 @@ fn main() -> Result<()> {
                 switch_frame(&w, &mut s, target);
             },
         );
+    }
+
+    // ---- HDU movie timer: while hdu-movie-active, advance to next loadable
+    //      HDU of the active frame's source file every 800 ms ----
+    let hdu_movie_timer = slint::Timer::default();
+    {
+        let weak = win.as_weak();
+        let state = Rc::clone(&state);
+        hdu_movie_timer.start(
+            slint::TimerMode::Repeated,
+            std::time::Duration::from_millis(800),
+            move || {
+                let Some(w) = weak.upgrade() else { return };
+                if !w.get_hdu_movie_active() { return; }
+                advance_hdu(&w, &mut state.borrow_mut());
+            },
+        );
+    }
+
+    // ---- HDU panel row click: load that HDU into the active frame ----
+    {
+        let weak = win.as_weak();
+        let state = Rc::clone(&state);
+        win.on_hdu_row_clicked(move |idx| {
+            let Some(w) = weak.upgrade() else { return };
+            if idx < 0 { return; }
+            load_hdu_into_active(&w, &mut state.borrow_mut(), idx as usize);
+        });
     }
 
     // ---- IPC server (Unix-domain socket) ----

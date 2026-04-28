@@ -35,6 +35,16 @@ struct TextMark {
     color: color,
 }
 
+// One row in the HDU navigator panel. Rust populates the model when the panel
+// opens; clicking a loadable row asks Rust to load that HDU into the active
+// frame.
+struct HduRow {
+    idx: int,
+    label: string,    // pre-formatted "[0] IMAGE 4096×4096"
+    loadable: bool,
+    active: bool,
+}
+
 global Style {
     out property <color> bg-deep:    #0b0e13;
     out property <color> bg-panel:   #161b22;
@@ -516,6 +526,15 @@ export component MainWindow inherits Window {
     // ---- blink mode toggle (Rust drives a 500-ms timer that calls Frame Next while on) ----
     in-out property <bool> blink-active: false;
 
+    // ---- HDU navigator panel ----
+    in-out property <bool>     hdu-panel-visible: false;
+    in-out property <[HduRow]> hdu-rows: [];
+    in-out property <string>   hdu-source-name: "—";
+    // ---- HDU movie toggle (Rust drives an 800-ms timer that loads the next
+    //      loadable HDU while on) ----
+    in-out property <bool>     hdu-movie-active: false;
+    callback hdu-row-clicked(int);
+
     // ---- main canvas viewport (image-pixel coords) — derived from the
     //      canvas Rectangle's actual size, populated below ----
     in-out property <length> canvas-w: 800px;
@@ -562,7 +581,7 @@ export component MainWindow inherits Window {
                 spacing: 0px;
                 MenuBarItem {
                     label: "File";
-                    items: ["Open…", "HDU Navigator…", "—",
+                    items: ["Open…", "HDU Navigator…", "Next HDU", "—",
                             "Save Image…", "Save FITS…", "Save TIFF…", "Save JPEG…", "Save PostScript…",
                             "—", "Print…", "—", "Quit"];
                     chosen(it) => { root.menu-action("File", it); }
@@ -582,7 +601,7 @@ export component MainWindow inherits Window {
                 MenuBarItem {
                     label: "Frame";
                     items: ["New Frame", "Delete Frame", "—", "Next", "Previous", "—",
-                            "Match…", "Blink", "RGB Composite", "—",
+                            "Match…", "Blink", "RGB Composite", "HDU Movie", "—",
                             "Rotate 180°", "Flip Horizontal", "Flip Vertical", "Reset Orientation",
                             "—",
                             "Lock Zoom", "Lock Pan", "Lock Color", "Lock Scale"];
@@ -902,6 +921,81 @@ export component MainWindow inherits Window {
                         source: root.histogram-image;
                         image-fit: fill;
                         image-rendering: smooth;
+                    }
+                }
+
+                // floating HDU navigator panel
+                if root.hdu-panel-visible: Rectangle {
+                    x: 12px;
+                    y: 40px;
+                    width: 360px;
+                    height: 280px;
+                    background: Style.bg-panel;
+                    border-color: Style.border-hi;
+                    border-width: 1px;
+                    border-radius: 3px;
+
+                    Text {
+                        x: 8px; y: 4px;
+                        text: "HDU NAVIGATOR  " + root.hdu-source-name;
+                        color: Style.accent;
+                        font-size: 10px;
+                        font-family: Style.mono;
+                    }
+                    Rectangle {
+                        x: parent.width - 22px; y: 3px;
+                        width: 18px; height: 18px;
+                        background: hcta.has-hover ? Style.bg-hover : transparent;
+                        border-radius: 2px;
+                        Text {
+                            x: 4px; y: -1px;
+                            text: "×";
+                            color: Style.text;
+                            font-size: 14px;
+                            font-family: Style.mono;
+                        }
+                        hcta := TouchArea {
+                            clicked => { root.hdu-panel-visible = false; }
+                        }
+                    }
+                    Rectangle {
+                        x: 8px; y: 22px;
+                        width:  parent.width  - 16px;
+                        height: parent.height - 30px;
+                        background: Style.bg-sunken;
+                        border-color: Style.border;
+                        border-width: 1px;
+
+                        ScrollView {
+                            x: 1px; y: 1px;
+                            width:  parent.width  - 2px;
+                            height: parent.height - 2px;
+                            VerticalLayout {
+                                spacing: 0px;
+                                for r[i] in root.hdu-rows: Rectangle {
+                                    height: 18px;
+                                    background: r.active
+                                        ? Style.accent-dim
+                                        : (hrta.has-hover && r.loadable
+                                            ? Style.bg-hover : transparent);
+                                    HorizontalLayout {
+                                        padding-left: 6px; padding-right: 6px;
+                                        Text {
+                                            text: r.label;
+                                            color: r.loadable ? Style.text : Style.text-dim;
+                                            font-size: 10px;
+                                            font-family: Style.mono;
+                                            vertical-alignment: center;
+                                            horizontal-stretch: 1;
+                                        }
+                                    }
+                                    hrta := TouchArea {
+                                        enabled: r.loadable;
+                                        clicked => { root.hdu-row-clicked(r.idx); }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
 
