@@ -3775,11 +3775,33 @@ fn handle_menu(window: &MainWindow, st: &mut State, menu: &str, item: &str) {
 fn dispatch_ipc(window: &MainWindow, st: &mut State, line: &str) -> String {
     let line = line.trim();
     if line.is_empty() { return String::new(); }
-    let toks: Vec<&str> = line.splitn(3, ' ').collect();
+    // We re-tokenise into 4 for verbs like `pan to X Y` and `scale limits A B`.
+    let toks: Vec<&str> = line.splitn(4, ' ').collect();
     match toks.as_slice() {
-        ["quit"] => { let _ = slint::quit_event_loop(); "ok".into() }
+        ["quit"] | ["exit"] => { let _ = slint::quit_event_loop(); "ok".into() }
+        ["xpaaccess"]   => "yes".into(),
+        ["version"]     => "ds9-rust 0.1".into(),
+        ["mode", m]     => {
+            window.set_active_mode(slint::SharedString::from(*m));
+            "ok".into()
+        }
         ["frame", "mosaic"]    => { handle_menu(window, st, "Frame", "Mosaic WCS"); "ok".into() }
         ["frame", "tile"]      => { handle_menu(window, st, "Frame", "Tile Frames"); "ok".into() }
+        ["frame", "new"]       => { handle_menu(window, st, "Frame", "New Frame"); "ok".into() }
+        ["frame", "delete"]    => { handle_menu(window, st, "Frame", "Delete Frame"); "ok".into() }
+        ["frame", "clear"]     => {
+            // XPA-style "clear active frame": drop markers and catalog,
+            // leave image. (DS9's `clear` actually wipes the image; we
+            // preserve it because the image is what the user just opened.)
+            if let Some(f) = st.active_frame_mut() {
+                f.markers.clear();
+                f.selected_marker = None;
+                f.catalog = None;
+                f.selected_catalog = None;
+            }
+            refresh_view(window, st);
+            "ok".into()
+        }
         ["samp", "image"]      => { handle_menu(window, st, "File", "SAMP Send Image"); "ok".into() }
         ["samp", "votable"]    => { handle_menu(window, st, "File", "SAMP Send VOTable…"); "ok".into() }
         ["frame", "next"]      => { handle_menu(window, st, "Frame", "Next"); "ok".into() }
@@ -3790,8 +3812,104 @@ fn dispatch_ipc(window: &MainWindow, st: &mut State, line: &str) -> String {
             }
             "ok".into()
         }
+        ["pan", "to", x, y] => {
+            // pan so that (x_fits, y_fits) appears under the canvas centre.
+            let (fx, fy) = match (x.parse::<f64>(), y.parse::<f64>()) {
+                (Ok(a), Ok(b)) => (a, b),
+                _ => return "err pan to X Y".into(),
+            };
+            let Some(f) = st.active_frame() else { return "err no frame".into() };
+            let (dx, dy) = fits_to_display_oriented(fx, fy, f);
+            let cw = window.get_canvas_w() as f64;
+            let ch = window.get_canvas_h() as f64;
+            let z  = window.get_view_zoom() as f64;
+            window.set_view_pan_x((cw * 0.5 - dx as f64 * z) as f32);
+            window.set_view_pan_y((ch * 0.5 - dy as f64 * z) as f32);
+            "ok".into()
+        }
+        ["crosshair"] => {
+            // toggle off
+            st.crosshair = None;
+            push_crosshair_to_window(window, st);
+            "ok".into()
+        }
+        ["crosshair", "clear"] => {
+            st.crosshair = None;
+            push_crosshair_to_window(window, st);
+            "ok".into()
+        }
+        ["crosshair", x, y] => {
+            let (fx, fy) = match (x.parse::<f64>(), y.parse::<f64>()) {
+                (Ok(a), Ok(b)) => (a, b),
+                _ => return "err crosshair X Y".into(),
+            };
+            let Some(f) = st.active_frame() else { return "err no frame".into() };
+            let (dx, dy) = fits_to_display_oriented(fx, fy, f);
+            set_crosshair_at_display(window, st, dx as f64, dy as f64);
+            "ok".into()
+        }
+        ["scale", "limits", a, b] => {
+            match (a.parse::<f32>(), b.parse::<f32>()) {
+                (Ok(low), Ok(high)) if high > low => {
+                    if let Some(f) = st.active_frame_mut() {
+                        f.limits_mode = LimitsMode::User { low, high };
+                    }
+                    refresh_view(window, st);
+                    "ok".into()
+                }
+                _ => "err scale limits LO HI (HI > LO)".into(),
+            }
+        }
         ["scale", s]            => { handle_menu(window, st, "Scale", s); "ok".into() }
+        ["cmap", "invert"]      => {
+            if let Some(f) = st.active_frame_mut() {
+                if let Some(lut) = &f.custom_lut {
+                    let mut new_lut: Box<[[u8; 3]; 256]> = lut.clone();
+                    new_lut.reverse();
+                    f.custom_lut = Some(new_lut);
+                } else {
+                    let mut lut: Box<[[u8; 3]; 256]> = Box::new([[0u8; 3]; 256]);
+                    let strip = f.cmap.rgba_strip();
+                    for i in 0..256 {
+                        let off = (255 - i) * 4;
+                        lut[i] = [strip[off], strip[off + 1], strip[off + 2]];
+                    }
+                    f.custom_lut = Some(lut);
+                }
+            }
+            refresh_view(window, st);
+            "ok".into()
+        }
         ["cmap", c]             => { handle_menu(window, st, "Color", c); "ok".into() }
+        ["regions", "delete", "all"] => {
+            handle_menu(window, st, "Region", "Delete All"); "ok".into()
+        }
+        ["regions", "delete", n] => {
+            match n.parse::<usize>() {
+                Ok(idx) if idx >= 1 => {
+                    if let Some(f) = st.active_frame_mut() {
+                        let i = idx - 1;
+                        if i < f.markers.len() {
+                            f.markers.remove(i);
+                            if f.selected_marker == Some(i) { f.selected_marker = None; }
+                            refresh_view(window, st);
+                            return "ok".into();
+                        }
+                    }
+                    "err: index out of range".into()
+                }
+                _ => "err: regions delete all|N (1-based)".into(),
+            }
+        }
+        ["regions", "load", path] => { region_load_path(window, st, Path::new(path)); "ok".into() }
+        ["regions", "save", path] => {
+            if let Some(f) = st.active_frame() {
+                match ds9_marker::write_reg(path, &f.markers) {
+                    Ok(()) => format!("ok {} regions", f.markers.len()),
+                    Err(e) => format!("err {e}"),
+                }
+            } else { "err no active frame".into() }
+        }
         ["bin", n]              => { handle_menu(window, st, "Bin", n); "ok".into() }
         ["zoom", "in"]          => { handle_menu(window, st, "Zoom", "Zoom In"); "ok".into() }
         ["zoom", "out"]         => { handle_menu(window, st, "Zoom", "Zoom Out"); "ok".into() }
@@ -3868,7 +3986,17 @@ fn dispatch_ipc(window: &MainWindow, st: &mut State, line: &str) -> String {
                 } else { "err out of bounds".into() }
             } else { "err no frame".into() }
         }
-        ["help"] => "commands: quit | frame next|previous|N|mosaic|tile | scale S | cmap C | bin N | zoom in|out|fit|N | region load|save P | file open P | save png|fits P | value | sextractor | crop [reset] | projection | centroid | radial | hdu next|list|N | movie on|off | help".into(),
+        ["help"] => "commands: quit|exit | xpaaccess | version | mode M | \
+            frame next|previous|N|new|delete|clear|mosaic|tile | \
+            pan to X Y | crosshair [X Y|clear] | \
+            scale S | scale limits LO HI | \
+            cmap C | cmap invert | bin N | \
+            zoom in|out|fit|N | \
+            region load|save P | regions load|save P | regions delete all|N | \
+            file open P | save png|fits P | value | sextractor | \
+            samp image|votable | \
+            crop [reset] | projection | centroid | radial | \
+            hdu next|list|N | movie on|off | help".into(),
         _ => format!("err unknown: {line}"),
     }
 }
@@ -3897,11 +4025,55 @@ fn region_load_path(window: &MainWindow, st: &mut State, p: &Path) {
     }
 }
 
+/// Drive the line-based IPC dispatch over a single duplex byte stream.
+/// Reads commands until EOF, calls `dispatch_ipc` on the UI thread, writes
+/// the response back. Used for both Unix-socket and TCP transports.
+fn handle_ipc_stream<S>(weak: slint::Weak<MainWindow>, mut stream: S)
+where S: std::io::Read + std::io::Write + Send + 'static + TryCloneStream<Cloned = S> {
+    use std::io::{BufRead, BufReader};
+    let read = match stream.try_clone_stream() { Ok(s) => s, Err(_) => return };
+    let mut reader = BufReader::new(read);
+    let mut line = String::new();
+    while reader.read_line(&mut line).map(|n| n > 0).unwrap_or(false) {
+        let cmd = line.trim().to_string();
+        line.clear();
+        if cmd.is_empty() { continue; }
+        let weak = weak.clone();
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let _ = slint::invoke_from_event_loop(move || {
+            let resp = if let Some(w) = weak.upgrade() {
+                STATE_FOR_IPC.with(|c| {
+                    if let Some(st) = c.borrow().as_ref() {
+                        dispatch_ipc(&w, &mut st.borrow_mut(), &cmd)
+                    } else { "err state unavailable".into() }
+                })
+            } else { "err window gone".into() };
+            let _ = tx.send(resp);
+        });
+        let resp = rx.recv().unwrap_or_else(|_| "err no response".into());
+        let _ = writeln!(stream, "{resp}");
+    }
+}
+
+/// Tiny abstraction for "give me a clone of this socket I can read from in a
+/// separate buffered reader". Only impl'd for the two stream types we use.
+trait TryCloneStream {
+    type Cloned;
+    fn try_clone_stream(&self) -> std::io::Result<Self::Cloned>;
+}
+impl TryCloneStream for std::os::unix::net::UnixStream {
+    type Cloned = Self;
+    fn try_clone_stream(&self) -> std::io::Result<Self> { self.try_clone() }
+}
+impl TryCloneStream for std::net::TcpStream {
+    type Cloned = Self;
+    fn try_clone_stream(&self) -> std::io::Result<Self> { self.try_clone() }
+}
+
 /// Spawn a thread that listens on a Unix-domain socket for line-based IPC
 /// commands. Returns the path so callers can advertise it.
 fn start_ipc_server(weak: slint::Weak<MainWindow>, state: Rc<RefCell<State>>) -> Option<PathBuf> {
     use std::os::unix::net::UnixListener;
-    use std::io::{BufRead, BufReader, Write};
 
     let dir = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
@@ -3914,39 +4086,52 @@ fn start_ipc_server(weak: slint::Weak<MainWindow>, state: Rc<RefCell<State>>) ->
         Err(e) => { eprintln!("ds9-rust IPC: bind {} failed: {e}", sock.display()); return None; }
     };
 
-    // Channel: IPC thread → UI thread
-    let _state = state;  // keep alive in closure
+    let _state = state; // keep alive in closure
     std::thread::spawn(move || {
         for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { continue };
+            let Ok(stream) = stream else { continue };
             let weak = weak.clone();
-            std::thread::spawn(move || {
-                let read = match stream.try_clone() { Ok(s) => s, Err(_) => return };
-                let mut reader = BufReader::new(read);
-                let mut line = String::new();
-                while reader.read_line(&mut line).map(|n| n > 0).unwrap_or(false) {
-                    let cmd = line.trim().to_string();
-                    line.clear();
-                    if cmd.is_empty() { continue; }
-                    let weak = weak.clone();
-                    let (tx, rx) = std::sync::mpsc::channel::<String>();
-                    let _ = slint::invoke_from_event_loop(move || {
-                        let resp = if let Some(w) = weak.upgrade() {
-                            STATE_FOR_IPC.with(|c| {
-                                if let Some(st) = c.borrow().as_ref() {
-                                    dispatch_ipc(&w, &mut st.borrow_mut(), &cmd)
-                                } else { "err state unavailable".into() }
-                            })
-                        } else { "err window gone".into() };
-                        let _ = tx.send(resp);
-                    });
-                    let resp = rx.recv().unwrap_or_else(|_| "err no response".into());
-                    let _ = writeln!(stream, "{resp}");
-                }
-            });
+            std::thread::spawn(move || handle_ipc_stream(weak, stream));
         }
     });
     Some(sock)
+}
+
+/// Bind a localhost-only TCP listener for the same line-based IPC. Picks an
+/// ephemeral port (or `DS9_RUST_TCP_PORT` if set). Returns the bound port.
+fn start_tcp_ipc_server(weak: slint::Weak<MainWindow>, state: Rc<RefCell<State>>) -> Option<u16> {
+    use std::net::TcpListener;
+    let port: u16 = env::var("DS9_RUST_TCP_PORT").ok()
+        .and_then(|s| s.parse().ok()).unwrap_or(0);
+    let bind_addr = format!("127.0.0.1:{port}");
+    let listener = match TcpListener::bind(&bind_addr) {
+        Ok(l) => l,
+        Err(e) => { eprintln!("ds9-rust IPC TCP: bind {bind_addr} failed: {e}"); return None; }
+    };
+    let port = listener.local_addr().ok()?.port();
+    let _state = state;
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            let weak = weak.clone();
+            std::thread::spawn(move || handle_ipc_stream(weak, stream));
+        }
+    });
+    Some(port)
+}
+
+/// Write the discovery file `~/.ds9-rust/xpa.info` listing how clients can
+/// reach this instance (analogous to xpans). Best-effort; failures are
+/// non-fatal.
+fn write_discovery_file(uds: Option<&Path>, tcp_port: Option<u16>) {
+    let Some(home) = env::var_os("HOME") else { return };
+    let dir = PathBuf::from(home).join(".ds9-rust");
+    let _ = std::fs::create_dir_all(&dir);
+    let pid = std::process::id();
+    let mut body = format!("pid={}\n", pid);
+    if let Some(p) = uds { body.push_str(&format!("unix={}\n", p.display())); }
+    if let Some(p) = tcp_port { body.push_str(&format!("tcp=127.0.0.1:{p}\n")); }
+    let _ = std::fs::write(dir.join("xpa.info"), body);
 }
 
 thread_local! {
@@ -4368,12 +4553,24 @@ fn main() -> Result<()> {
         });
     }
 
-    // ---- IPC server (Unix-domain socket) ----
+    // ---- IPC servers (Unix-domain socket + localhost TCP) ----
     STATE_FOR_IPC.with(|c| { *c.borrow_mut() = Some(Rc::clone(&state)); });
-    if let Some(p) = start_ipc_server(win.as_weak(), Rc::clone(&state)) {
-        eprintln!("ds9-rust IPC listening on {}", p.display());
-        win.set_status_text(format!("ready  (ipc: {})", p.display()).into());
+    let uds = start_ipc_server(win.as_weak(), Rc::clone(&state));
+    let tcp = start_tcp_ipc_server(win.as_weak(), Rc::clone(&state));
+    if let Some(p) = &uds {
+        eprintln!("ds9-rust IPC (unix) listening on {}", p.display());
     }
+    if let Some(port) = tcp {
+        eprintln!("ds9-rust IPC (tcp) listening on 127.0.0.1:{port}");
+    }
+    write_discovery_file(uds.as_deref(), tcp);
+    let banner = match (&uds, tcp) {
+        (Some(p), Some(port)) => format!("ready  (ipc: {} | tcp:{})", p.display(), port),
+        (Some(p), None)       => format!("ready  (ipc: {})", p.display()),
+        (None, Some(port))    => format!("ready  (tcp: 127.0.0.1:{port})"),
+        (None, None)          => "ready  (no ipc)".into(),
+    };
+    win.set_status_text(banner.into());
 
     win.run()?;
     Ok(())
