@@ -529,6 +529,19 @@ export component MainWindow inherits Window {
     // ---- blink mode toggle (Rust drives a 500-ms timer that calls Frame Next while on) ----
     in-out property <bool> blink-active: false;
 
+    // ---- preferences panel (default cmap/stretch/limits/smooth/bin/blink) ----
+    in-out property <bool>   prefs-visible: false;
+    in-out property <string> prefs-cmap:    "grey";
+    in-out property <string> prefs-stretch: "linear";
+    in-out property <string> prefs-limits:  "zscale";
+    in-out property <string> prefs-smooth:  "off";
+    in-out property <string> prefs-bin:     "1";
+    in-out property <string> prefs-blink:   "500";
+    in-out property <string> prefs-status:  "";
+    callback prefs-apply();
+    callback prefs-save();
+    callback prefs-reset();
+
     // ---- region property editor (operates on the selected marker) ----
     in-out property <bool>   region-prop-visible: false;
     in-out property <string> region-prop-kind:    "—";
@@ -606,7 +619,8 @@ export component MainWindow inherits Window {
                 MenuBarItem {
                     label: "Edit";
                     items: ["Undo", "Redo", "—", "Cut", "Copy", "Paste", "—",
-                            "Crop to Selected", "Reset Crop"];
+                            "Crop to Selected", "Reset Crop", "—",
+                            "Preferences…"];
                     chosen(it) => { root.menu-action("Edit", it); }
                 }
                 MenuBarItem {
@@ -939,6 +953,108 @@ export component MainWindow inherits Window {
                         source: root.histogram-image;
                         image-fit: fill;
                         image-rendering: smooth;
+                    }
+                }
+
+                // floating Preferences panel
+                if root.prefs-visible: Rectangle {
+                    x: parent.width - 412px;
+                    y: 280px;
+                    width: 400px;
+                    height: 290px;
+                    background: Style.bg-panel;
+                    border-color: Style.border-hi;
+                    border-width: 1px;
+                    border-radius: 3px;
+
+                    Text {
+                        x: 8px; y: 4px;
+                        text: "PREFERENCES";
+                        color: Style.accent;
+                        font-size: 10px;
+                        font-family: Style.mono;
+                    }
+                    Rectangle {
+                        x: parent.width - 22px; y: 3px;
+                        width: 18px; height: 18px;
+                        background: prfcta.has-hover ? Style.bg-hover : transparent;
+                        border-radius: 2px;
+                        Text {
+                            x: 4px; y: -1px;
+                            text: "×";
+                            color: Style.text;
+                            font-size: 14px;
+                            font-family: Style.mono;
+                        }
+                        prfcta := TouchArea {
+                            clicked => { root.prefs-visible = false; }
+                        }
+                    }
+
+                    VerticalLayout {
+                        x: 8px; y: 24px;
+                        width: parent.width - 16px;
+                        height: parent.height - 32px;
+                        spacing: 4px;
+
+                        HorizontalLayout {
+                            spacing: 4px; height: 24px;
+                            Text { text: "cmap"; color: Style.text-dim; font-size: 11px;
+                                   font-family: Style.mono; vertical-alignment: center; width: 56px; }
+                            LineEdit { text <=> root.prefs-cmap;    horizontal-stretch: 1;
+                                       placeholder-text: "grey"; }
+                        }
+                        HorizontalLayout {
+                            spacing: 4px; height: 24px;
+                            Text { text: "stretch"; color: Style.text-dim; font-size: 11px;
+                                   font-family: Style.mono; vertical-alignment: center; width: 56px; }
+                            LineEdit { text <=> root.prefs-stretch; horizontal-stretch: 1;
+                                       placeholder-text: "linear log sqrt squared asinh sinh"; }
+                        }
+                        HorizontalLayout {
+                            spacing: 4px; height: 24px;
+                            Text { text: "limits"; color: Style.text-dim; font-size: 11px;
+                                   font-family: Style.mono; vertical-alignment: center; width: 56px; }
+                            LineEdit { text <=> root.prefs-limits;  horizontal-stretch: 1;
+                                       placeholder-text: "zscale | minmax"; }
+                        }
+                        HorizontalLayout {
+                            spacing: 4px; height: 24px;
+                            Text { text: "smooth"; color: Style.text-dim; font-size: 11px;
+                                   font-family: Style.mono; vertical-alignment: center; width: 56px; }
+                            LineEdit { text <=> root.prefs-smooth;  horizontal-stretch: 1;
+                                       placeholder-text: "off | gaussian:N | boxcar:N | median:N"; }
+                        }
+                        HorizontalLayout {
+                            spacing: 4px; height: 24px;
+                            Text { text: "bin"; color: Style.text-dim; font-size: 11px;
+                                   font-family: Style.mono; vertical-alignment: center; width: 56px; }
+                            LineEdit { text <=> root.prefs-bin;     horizontal-stretch: 1;
+                                       placeholder-text: "1 2 4 8 16 32"; }
+                        }
+                        HorizontalLayout {
+                            spacing: 4px; height: 24px;
+                            Text { text: "blink"; color: Style.text-dim; font-size: 11px;
+                                   font-family: Style.mono; vertical-alignment: center; width: 56px; }
+                            LineEdit { text <=> root.prefs-blink;   horizontal-stretch: 1;
+                                       placeholder-text: "ms (restart needed)"; }
+                        }
+
+                        Text {
+                            text: root.prefs-status;
+                            color: Style.text-dim;
+                            font-size: 10px;
+                            font-family: Style.mono;
+                            wrap: word-wrap;
+                        }
+
+                        HorizontalLayout {
+                            spacing: 6px; height: 26px;
+                            Button { text: "Apply"; clicked => { root.prefs-apply(); } }
+                            Button { text: "Save";  clicked => { root.prefs-save(); } }
+                            Button { text: "Reset"; clicked => { root.prefs-reset(); } }
+                            Rectangle { horizontal-stretch: 1; }
+                        }
                     }
                 }
 

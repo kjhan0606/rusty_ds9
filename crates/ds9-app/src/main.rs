@@ -177,6 +177,37 @@ struct Crosshair {
     pixel: (usize, f64, f64),
 }
 
+/// Session-wide user preferences. Applied to every newly-created frame
+/// (and optionally pushed onto the active frame via `Edit ▸ Preferences ▸
+/// Apply`). Persisted to `~/.config/ds9-rust/prefs.toml` (simple
+/// `key = value` text — no real TOML parser needed).
+#[derive(Clone, Debug)]
+struct Prefs {
+    cmap:    String, // "grey" / "heat" / …
+    stretch: String, // "linear" / "log" / …
+    limits:  String, // "zscale" / "minmax"
+    /// `off | gaussian:SIGMA | boxcar:N | median:N`
+    smooth:  String,
+    /// Block-bin factor (1 = off).
+    bin:     u32,
+    /// Blink interval in ms (informational only after startup; the timer
+    /// is fixed once `main()` runs).
+    blink_ms: u32,
+}
+
+impl Default for Prefs {
+    fn default() -> Self {
+        Self {
+            cmap: "grey".into(),
+            stretch: "linear".into(),
+            limits: "zscale".into(),
+            smooth: "off".into(),
+            bin: 1,
+            blink_ms: 500,
+        }
+    }
+}
+
 struct State {
     frames: Vec<Frame>,
     /// Index into `frames`; only meaningful when `frames` is non-empty.
@@ -191,6 +222,9 @@ struct State {
     lock_pan:   bool,
     lock_cmap:  bool,
     lock_scale: bool,
+    /// Session-wide defaults (applied to new frames; editable via
+    /// `Edit ▸ Preferences…`).
+    prefs: Prefs,
 }
 
 impl State {
@@ -205,6 +239,7 @@ impl State {
             lock_pan: false,
             lock_cmap: false,
             lock_scale: false,
+            prefs: Prefs::default(),
         }
     }
 
@@ -1171,6 +1206,7 @@ fn load_into(window: &MainWindow, st: &mut State, path: &Path) {
             save_view_into_active(window, st);
             let mut fr = Frame::new(img, name);
             fr.source_path = Some(path.to_path_buf());
+            apply_prefs_to_frame(&st.prefs, &mut fr);
             st.frames.push(fr);
             st.active = st.frames.len() - 1;
             window.set_status_text(
@@ -2104,6 +2140,168 @@ fn advance_hdu(window: &MainWindow, st: &mut State) {
     load_hdu_into_active(window, st, target);
 }
 
+// -------------------------------------------------------------- prefs --
+
+/// Parse the smooth-mini-language used by `Prefs` and the Preferences panel:
+/// `off | gaussian:SIGMA | boxcar:N | median:N`. Whitespace tolerated. On a
+/// parse error the default (off) is returned.
+fn parse_smooth_spec(s: &str) -> SmoothKind {
+    let s = s.trim().to_ascii_lowercase();
+    if s.is_empty() || s == "off" || s == "none" {
+        return SmoothKind::Gaussian { sigma: 0.0 };
+    }
+    let (kind, val) = match s.split_once(':') {
+        Some((k, v)) => (k.trim(), v.trim()),
+        None => return SmoothKind::Gaussian { sigma: 0.0 },
+    };
+    match kind {
+        "gaussian" | "gauss" | "g" => {
+            let sigma: f32 = val.parse().unwrap_or(0.0);
+            SmoothKind::Gaussian { sigma: sigma.max(0.0) }
+        }
+        "boxcar" | "box" | "b" => {
+            let n: u32 = val.parse().unwrap_or(0);
+            let n = n.max(1);
+            // boxcar/median expect odd window
+            let n = if n % 2 == 0 { n + 1 } else { n };
+            SmoothKind::Boxcar { n }
+        }
+        "median" | "med" | "m" => {
+            let n: u32 = val.parse().unwrap_or(0);
+            let n = n.max(1);
+            let n = if n % 2 == 0 { n + 1 } else { n };
+            SmoothKind::Median { n }
+        }
+        _ => SmoothKind::Gaussian { sigma: 0.0 },
+    }
+}
+
+fn parse_limits_spec(s: &str) -> Option<LimitsMode> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "zscale" => Some(LimitsMode::Zscale),
+        "minmax" => Some(LimitsMode::MinMax),
+        _        => None,
+    }
+}
+
+fn parse_stretch_spec(s: &str) -> Option<Stretch> {
+    Some(match s.trim().to_ascii_lowercase().as_str() {
+        "linear"  => Stretch::Linear,
+        "log"     => Stretch::Log,
+        "sqrt"    => Stretch::Sqrt,
+        "squared" => Stretch::Squared,
+        "asinh"   => Stretch::Asinh,
+        "sinh"    => Stretch::Sinh,
+        _         => return None,
+    })
+}
+
+/// Apply the session prefs as the *initial* state of a freshly-created frame.
+/// Called from `load_into` (and other Frame creation sites) right after
+/// `Frame::new` so that user-saved defaults stick to every loaded image.
+fn apply_prefs_to_frame(prefs: &Prefs, fr: &mut Frame) {
+    if let Some(c) = Colormap::from_name(&prefs.cmap) { fr.cmap = c; }
+    if let Some(s) = parse_stretch_spec(&prefs.stretch) { fr.stretch = s; }
+    if let Some(lm) = parse_limits_spec(&prefs.limits) { fr.limits_mode = lm; }
+    let sk = parse_smooth_spec(&prefs.smooth);
+    fr.smooth_kind = sk;
+    if let SmoothKind::Gaussian { sigma } = sk { fr.smooth_sigma = sigma; }
+    fr.bin_factor = prefs.bin.max(1);
+}
+
+fn populate_prefs_panel(window: &MainWindow, st: &State) {
+    let p = &st.prefs;
+    window.set_prefs_cmap(p.cmap.clone().into());
+    window.set_prefs_stretch(p.stretch.clone().into());
+    window.set_prefs_limits(p.limits.clone().into());
+    window.set_prefs_smooth(p.smooth.clone().into());
+    window.set_prefs_bin(p.bin.to_string().into());
+    window.set_prefs_blink(p.blink_ms.to_string().into());
+    window.set_prefs_status("edit fields, then Apply (this session) or Save (persist).".into());
+}
+
+/// Read the panel fields → update `State.prefs` → push them onto the active
+/// frame and refresh.
+fn apply_prefs_from_panel(window: &MainWindow, st: &mut State) {
+    let cmap    = window.get_prefs_cmap().as_str().trim().to_string();
+    let stretch = window.get_prefs_stretch().as_str().trim().to_string();
+    let limits  = window.get_prefs_limits().as_str().trim().to_string();
+    let smooth  = window.get_prefs_smooth().as_str().trim().to_string();
+    let bin     = window.get_prefs_bin().as_str().trim().parse::<u32>().unwrap_or(1).max(1);
+    let blink   = window.get_prefs_blink().as_str().trim().parse::<u32>().unwrap_or(500).max(50);
+
+    let mut warnings = Vec::<&'static str>::new();
+    if Colormap::from_name(&cmap).is_none()      { warnings.push("cmap"); }
+    if parse_stretch_spec(&stretch).is_none()    { warnings.push("stretch"); }
+    if parse_limits_spec(&limits).is_none()      { warnings.push("limits"); }
+
+    st.prefs = Prefs { cmap, stretch, limits, smooth, bin, blink_ms: blink };
+    let p = st.prefs.clone();
+    if let Some(f) = st.active_frame_mut() {
+        apply_prefs_to_frame(&p, f);
+    }
+    refresh_view(window, st);
+
+    let msg = if warnings.is_empty() {
+        "prefs applied to active frame and session defaults.".to_string()
+    } else {
+        format!("prefs applied; ignored unknown: {}.", warnings.join(", "))
+    };
+    window.set_prefs_status(msg.into());
+    window.set_status_text("prefs applied".into());
+}
+
+fn prefs_path() -> Option<PathBuf> {
+    let base = env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    Some(base.join("ds9-rust").join("prefs.toml"))
+}
+
+fn save_prefs_to_disk(prefs: &Prefs) -> std::io::Result<PathBuf> {
+    let p = prefs_path().ok_or_else(|| std::io::Error::new(
+        std::io::ErrorKind::NotFound, "no $HOME / $XDG_CONFIG_HOME"))?;
+    if let Some(parent) = p.parent() { std::fs::create_dir_all(parent)?; }
+    let body = format!(
+        "# ds9-rust preferences\n\
+         cmap     = \"{}\"\n\
+         stretch  = \"{}\"\n\
+         limits   = \"{}\"\n\
+         smooth   = \"{}\"\n\
+         bin      = {}\n\
+         blink_ms = {}\n",
+        prefs.cmap, prefs.stretch, prefs.limits, prefs.smooth, prefs.bin, prefs.blink_ms,
+    );
+    std::fs::write(&p, body)?;
+    Ok(p)
+}
+
+/// Best-effort load of `prefs.toml`. We hand-parse `key = value` lines with
+/// optional double-quoted strings; missing/invalid keys fall back to the
+/// `Default::default()` value. This avoids pulling in a real TOML crate.
+fn load_prefs_from_disk() -> Prefs {
+    let mut p = Prefs::default();
+    let Some(path) = prefs_path() else { return p };
+    let Ok(text) = std::fs::read_to_string(&path) else { return p };
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') { continue; }
+        let Some((k, v)) = line.split_once('=') else { continue };
+        let k = k.trim();
+        let v = v.trim().trim_matches('"').to_string();
+        match k {
+            "cmap"     => p.cmap = v,
+            "stretch"  => p.stretch = v,
+            "limits"   => p.limits = v,
+            "smooth"   => p.smooth = v,
+            "bin"      => if let Ok(n) = v.parse::<u32>() { p.bin = n.max(1); },
+            "blink_ms" => if let Ok(n) = v.parse::<u32>() { p.blink_ms = n.max(50); },
+            _ => {}
+        }
+    }
+    p
+}
+
 // ---------------------------------------------------------------- menus --
 
 fn handle_menu(window: &MainWindow, st: &mut State, menu: &str, item: &str) {
@@ -2788,6 +2986,16 @@ fn handle_menu(window: &MainWindow, st: &mut State, menu: &str, item: &str) {
             ).into());
         }
         ("Edit", "Reset Crop") => { handle_menu(window, st, "Zoom", "Reset"); }
+        ("Edit", "Preferences…") => {
+            if window.get_prefs_visible() {
+                window.set_prefs_visible(false);
+                window.set_status_text("preferences: hidden".into());
+            } else {
+                populate_prefs_panel(window, st);
+                window.set_prefs_visible(true);
+                window.set_status_text("preferences: shown".into());
+            }
+        }
 
         ("Help", "About ds9-rust") => {
             window.set_status_text(
@@ -2991,6 +3199,9 @@ fn main() -> Result<()> {
     let argv: Vec<String> = env::args().collect();
     let win = MainWindow::new()?;
     let state = Rc::new(RefCell::new(State::new()));
+    // Pull persisted preferences (if any) before loading the first file so
+    // those defaults stick to every frame in this session.
+    state.borrow_mut().prefs = load_prefs_from_disk();
 
     refresh_view(&win, &state.borrow());
 
@@ -3309,6 +3520,44 @@ fn main() -> Result<()> {
         win.on_region_prop_revert(move || {
             let Some(w) = weak.upgrade() else { return };
             populate_region_props(&w, &state.borrow());
+        });
+    }
+
+    // ---- Preferences — Apply / Save / Reset ----
+    {
+        let weak = win.as_weak();
+        let state = Rc::clone(&state);
+        win.on_prefs_apply(move || {
+            let Some(w) = weak.upgrade() else { return };
+            apply_prefs_from_panel(&w, &mut state.borrow_mut());
+        });
+    }
+    {
+        let weak = win.as_weak();
+        let state = Rc::clone(&state);
+        win.on_prefs_save(move || {
+            let Some(w) = weak.upgrade() else { return };
+            // Write the *currently shown* values, not the last-applied ones,
+            // so users can save without first clicking Apply.
+            apply_prefs_from_panel(&w, &mut state.borrow_mut());
+            let st = state.borrow();
+            match save_prefs_to_disk(&st.prefs) {
+                Ok(p)  => w.set_prefs_status(format!("saved → {}", p.display()).into()),
+                Err(e) => w.set_prefs_status(format!("save failed: {e}").into()),
+            }
+        });
+    }
+    {
+        let weak = win.as_weak();
+        let state = Rc::clone(&state);
+        win.on_prefs_reset(move || {
+            let Some(w) = weak.upgrade() else { return };
+            {
+                let mut st = state.borrow_mut();
+                st.prefs = Prefs::default();
+            }
+            populate_prefs_panel(&w, &state.borrow());
+            w.set_prefs_status("reset to factory defaults (not yet applied — click Apply).".into());
         });
     }
 
