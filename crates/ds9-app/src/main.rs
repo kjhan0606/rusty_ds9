@@ -3114,10 +3114,22 @@ fn load_prefs_from_disk() -> Prefs {
 
 // ---------------------------------------------------------------- menus --
 
+// Defer invoking the open-file dialog so the caller's State borrow
+// (held by on_menu_action) drops first. rfd::FileDialog pumps the macOS
+// run loop, and on_request_open_file then takes its own State borrow.
+fn defer_open_file(window: &MainWindow) {
+    let weak = window.as_weak();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(w) = weak.upgrade() {
+            w.invoke_request_open_file();
+        }
+    });
+}
+
 fn handle_menu(window: &MainWindow, st: &mut State, menu: &str, item: &str) {
     match (menu, item) {
         // File
-        ("File", "Open…") => window.invoke_request_open_file(),
+        ("File", "Open…") => defer_open_file(window),
         ("File", "Save Image…") => save_image_png(window, st),
         ("File", "Save FITS…")  => save_image_fits(window, st),
         ("File", "Save TIFF…") => {
@@ -3258,7 +3270,7 @@ fn handle_menu(window: &MainWindow, st: &mut State, menu: &str, item: &str) {
         }
 
         // Frame
-        ("Frame", "New Frame") => window.invoke_request_open_file(),
+        ("Frame", "New Frame") => defer_open_file(window),
         ("Frame", "Delete Frame") => {
             if st.frames.is_empty() {
                 window.set_status_text("no frames to delete".into());
@@ -4332,12 +4344,15 @@ fn main() -> Result<()> {
         let state = Rc::clone(&state);
         win.on_request_open_file(move || {
             let Some(w) = weak.upgrade() else { return };
+            // Re-entrance guard (another handler still holds State).
+            if state.try_borrow_mut().is_err() { return; }
             let chosen: Option<PathBuf> = rfd::FileDialog::new()
                 .set_title("Open FITS")
                 .add_filter("FITS", &["fits", "fit", "fts", "fz"])
                 .add_filter("All", &["*"])
                 .pick_file();
             if let Some(p) = chosen {
+                if state.try_borrow_mut().is_err() { return; }
                 load_into(&w, &mut state.borrow_mut(), &p);
             }
         });
@@ -4576,6 +4591,10 @@ fn main() -> Result<()> {
         let state = Rc::clone(&state);
         win.on_menu_action(move |menu, item| {
             let Some(w) = weak.upgrade() else { return };
+            // Re-entrance guard: while a menu handler is already running an
+            // rfd dialog, the macOS run loop may dispatch another menu click
+            // — drop it instead of panicking on a nested borrow.
+            if state.try_borrow_mut().is_err() { return; }
             handle_menu(&w, &mut state.borrow_mut(), &menu, &item);
         });
     }
@@ -4626,6 +4645,7 @@ fn main() -> Result<()> {
         win.on_hdu_row_clicked(move |idx| {
             let Some(w) = weak.upgrade() else { return };
             if idx < 0 { return; }
+            if state.try_borrow_mut().is_err() { return; }
             load_hdu_into_active(&w, &mut state.borrow_mut(), idx as usize);
         });
     }
@@ -4636,6 +4656,7 @@ fn main() -> Result<()> {
         let state = Rc::clone(&state);
         win.on_region_prop_apply(move || {
             let Some(w) = weak.upgrade() else { return };
+            if state.try_borrow_mut().is_err() { return; }
             apply_region_props(&w, &mut state.borrow_mut());
         });
     }
@@ -4644,7 +4665,8 @@ fn main() -> Result<()> {
         let state = Rc::clone(&state);
         win.on_region_prop_revert(move || {
             let Some(w) = weak.upgrade() else { return };
-            populate_region_props(&w, &state.borrow());
+            let Ok(s) = state.try_borrow() else { return };
+            populate_region_props(&w, &s);
         });
     }
 
@@ -4654,6 +4676,7 @@ fn main() -> Result<()> {
         let state = Rc::clone(&state);
         win.on_prefs_apply(move || {
             let Some(w) = weak.upgrade() else { return };
+            if state.try_borrow_mut().is_err() { return; }
             apply_prefs_from_panel(&w, &mut state.borrow_mut());
         });
     }
@@ -4662,6 +4685,7 @@ fn main() -> Result<()> {
         let state = Rc::clone(&state);
         win.on_prefs_save(move || {
             let Some(w) = weak.upgrade() else { return };
+            if state.try_borrow_mut().is_err() { return; }
             // Write the *currently shown* values, not the last-applied ones,
             // so users can save without first clicking Apply.
             apply_prefs_from_panel(&w, &mut state.borrow_mut());
@@ -4677,6 +4701,7 @@ fn main() -> Result<()> {
         let state = Rc::clone(&state);
         win.on_prefs_reset(move || {
             let Some(w) = weak.upgrade() else { return };
+            if state.try_borrow_mut().is_err() { return; }
             {
                 let mut st = state.borrow_mut();
                 st.prefs = Prefs::default();
@@ -4692,6 +4717,7 @@ fn main() -> Result<()> {
         let state = Rc::clone(&state);
         win.on_netcat_resolve(move || {
             let Some(w) = weak.upgrade() else { return };
+            if state.try_borrow_mut().is_err() { return; }
             netcat_resolve(&w, &mut state.borrow_mut());
         });
     }
@@ -4700,6 +4726,7 @@ fn main() -> Result<()> {
         let state = Rc::clone(&state);
         win.on_netcat_vizier(move || {
             let Some(w) = weak.upgrade() else { return };
+            if state.try_borrow_mut().is_err() { return; }
             netcat_vizier(&w, &mut state.borrow_mut());
         });
     }
@@ -4708,6 +4735,7 @@ fn main() -> Result<()> {
         let state = Rc::clone(&state);
         win.on_netcat_ned(move || {
             let Some(w) = weak.upgrade() else { return };
+            if state.try_borrow_mut().is_err() { return; }
             netcat_ned(&w, &mut state.borrow_mut());
         });
     }
