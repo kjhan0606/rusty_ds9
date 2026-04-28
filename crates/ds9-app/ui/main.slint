@@ -475,6 +475,9 @@ export component MainWindow inherits Window {
     in-out property <bool>  contour-visible:    false;
     in-out property <bool>  projection-visible: false;
     in-out property <string> projection-caption: "PROJECTION";
+    in-out property <image> radial-image;
+    in-out property <bool>  radial-visible: false;
+    in-out property <string> radial-caption: "RADIAL PROFILE";
 
     // ---- coordinate grid overlay (WCS RA/Dec) ----
     in-out property <image> grid-image;
@@ -635,7 +638,7 @@ export component MainWindow inherits Window {
                 MenuBarItem {
                     label: "Region";
                     items: ["New", "Load…", "Save…", "—", "Delete Selected", "Delete All", "—",
-                            "Projection…", "—", "Info"];
+                            "Projection…", "Radial Profile…", "Centroid", "—", "Info"];
                     chosen(it) => { root.menu-action("Region", it); }
                 }
                 MenuBarItem {
@@ -996,6 +999,51 @@ export component MainWindow inherits Window {
                                 }
                             }
                         }
+                    }
+                }
+
+                // floating radial-profile panel (mean flux per r-bin in a
+                // selected Circle / Ellipse / Annulus aperture)
+                if root.radial-visible: Rectangle {
+                    x: parent.width - 412px;
+                    y: 40px;
+                    width: 400px;
+                    height: 230px;
+                    background: Style.bg-panel;
+                    border-color: Style.border-hi;
+                    border-width: 1px;
+                    border-radius: 3px;
+
+                    Text {
+                        x: 8px; y: 4px;
+                        text: root.radial-caption;
+                        color: Style.accent;
+                        font-size: 10px;
+                        font-family: Style.mono;
+                    }
+                    Rectangle {
+                        x: parent.width - 22px; y: 3px;
+                        width: 18px; height: 18px;
+                        background: rcta.has-hover ? Style.bg-hover : transparent;
+                        border-radius: 2px;
+                        Text {
+                            x: 4px; y: -1px;
+                            text: "×";
+                            color: Style.text;
+                            font-size: 14px;
+                            font-family: Style.mono;
+                        }
+                        rcta := TouchArea {
+                            clicked => { root.radial-visible = false; }
+                        }
+                    }
+                    Image {
+                        x: 8px; y: 24px;
+                        width:  parent.width  - 16px;
+                        height: parent.height - 32px;
+                        source: root.radial-image;
+                        image-fit: fill;
+                        image-rendering: smooth;
                     }
                 }
 

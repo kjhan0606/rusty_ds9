@@ -1722,6 +1722,95 @@ fn hex_nib(n: u8) -> u8 {
     if n < 10 { b'0' + n } else { b'a' + (n - 10) }
 }
 
+// -------------------------------------------------------- region analysis --
+
+/// Iterate (x_fits, y_fits, value) over every finite pixel inside a circular
+/// aperture of radius `r` centered at (cx, cy) in FITS coords. Skips
+/// out-of-bounds and NaN samples.
+fn aperture_iter<'a>(
+    f: &'a Frame, cx: f64, cy: f64, r: f64,
+) -> impl Iterator<Item = (f64, f64, f32)> + 'a {
+    let (w, h) = (f.fits.width, f.fits.height);
+    let r2 = r * r;
+    let x_lo = ((cx - r).floor() as isize).max(1);
+    let x_hi = ((cx + r).ceil()  as isize).min(w as isize);
+    let y_lo = ((cy - r).floor() as isize).max(1);
+    let y_hi = ((cy + r).ceil()  as isize).min(h as isize);
+    (y_lo..=y_hi).flat_map(move |yf| {
+        (x_lo..=x_hi).filter_map(move |xf| {
+            let dx = xf as f64 - cx;
+            let dy = yf as f64 - cy;
+            if dx * dx + dy * dy > r2 { return None; }
+            // FITS y is bottom-up; storage is top-down.
+            let ix = (xf - 1) as usize;
+            let iy = h - yf as usize;
+            let v = f.fits.data[iy * w + ix];
+            if !v.is_finite() { return None; }
+            Some((xf as f64, yf as f64, v))
+        })
+    })
+}
+
+/// Intensity-weighted centroid of pixels in `aperture` whose value is above
+/// the local background (= aperture median). Returns (cx, cy) in FITS coords,
+/// or None if there are too few above-background pixels.
+fn compute_centroid(f: &Frame, cx: f64, cy: f64, r: f64) -> Option<(f64, f64)> {
+    let mut samples: Vec<(f64, f64, f32)> = aperture_iter(f, cx, cy, r).collect();
+    if samples.len() < 4 { return None; }
+    samples.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+    let bg = samples[samples.len() / 2].2;
+    let mut sw = 0.0_f64;
+    let mut sx = 0.0_f64;
+    let mut sy = 0.0_f64;
+    let mut n = 0_usize;
+    for (x, y, v) in &samples {
+        let w_ = (*v - bg).max(0.0) as f64;
+        if w_ <= 0.0 { continue; }
+        sw += w_;
+        sx += w_ * x;
+        sy += w_ * y;
+        n += 1;
+    }
+    if n < 3 || sw <= 0.0 { return None; }
+    Some((sx / sw, sy / sw))
+}
+
+/// Mean pixel value per radial bin in [0, r_max], with `n_bins` equal-width
+/// bins. Empty bins return NaN. Returns the bin centers so plot code can use
+/// them as labels.
+fn compute_radial_profile(
+    f: &Frame, cx: f64, cy: f64, r_max: f64, n_bins: usize,
+) -> Vec<f32> {
+    let mut sum = vec![0.0_f64; n_bins];
+    let mut cnt = vec![0_u64;   n_bins];
+    let r_max = r_max.max(1.0);
+    for (x, y, v) in aperture_iter(f, cx, cy, r_max) {
+        let dx = x - cx;
+        let dy = y - cy;
+        let r = (dx * dx + dy * dy).sqrt();
+        let b = ((r / r_max) * n_bins as f64).floor() as usize;
+        let b = b.min(n_bins - 1);
+        sum[b] += v as f64;
+        cnt[b] += 1;
+    }
+    sum.iter().zip(cnt.iter()).map(|(s, &c)| {
+        if c == 0 { f32::NAN } else { (s / c as f64) as f32 }
+    }).collect()
+}
+
+/// Project the selected marker (or the only marker) into a (cx, cy, r_eff)
+/// triple suitable for centroid / radial-profile aperture math. Returns None
+/// if the shape doesn't have a natural circular extent (Polygon / Line / …).
+fn marker_aperture(m: &Marker) -> Option<(f64, f64, f64)> {
+    match &m.shape {
+        MShape::Circle  { center, r }            => Some((center.x, center.y, *r)),
+        MShape::Annulus { center, r_outer, .. }  => Some((center.x, center.y, *r_outer)),
+        MShape::Ellipse { center, a, b, .. }     => Some((center.x, center.y, a.max(*b))),
+        MShape::Box     { center, w, h, .. }     => Some((center.x, center.y, (w.max(*h)) * 0.5)),
+        _ => None,
+    }
+}
+
 // ---------------------------------------------------------------- HDU --
 
 /// True for HDU kinds whose data we can render as an image.
@@ -2219,6 +2308,68 @@ fn handle_menu(window: &MainWindow, st: &mut State, menu: &str, item: &str) {
                 else  { "projection: hidden".into() }
             );
         }
+        ("Region", "Centroid") => {
+            // Find a marker with a circular extent (selected first, else first
+            // such marker), compute centroid, snap its center to it.
+            let aperture: Option<(usize, f64, f64, f64)> = st.active_frame().and_then(|f| {
+                let pick_idx = f.selected_marker
+                    .filter(|&i| f.markers.get(i).and_then(marker_aperture).is_some())
+                    .or_else(|| f.markers.iter().position(|m| marker_aperture(m).is_some()));
+                pick_idx.and_then(|i| {
+                    marker_aperture(&f.markers[i]).map(|(cx, cy, r)| (i, cx, cy, r))
+                })
+            });
+            let Some((idx, cx, cy, r)) = aperture else {
+                window.set_status_text(
+                    "centroid: select a Circle / Box / Ellipse / Annulus region first".into()
+                );
+                return;
+            };
+            let Some(f) = st.active_frame() else { return };
+            let Some((nx, ny)) = compute_centroid(f, cx, cy, r) else {
+                window.set_status_text("centroid: not enough flux above local background".into());
+                return;
+            };
+            let (dx, dy) = (nx - cx, ny - cy);
+            if let Some(f) = st.active_frame_mut() {
+                if let Some(m) = f.markers.get_mut(idx) {
+                    translate_marker(m, dx, dy);
+                    f.selected_marker = Some(idx);
+                }
+            }
+            refresh_view(window, st);
+            window.set_status_text(format!(
+                "centroid: ({:.2}, {:.2}) → ({:.2}, {:.2}) Δ=({:+.2}, {:+.2})",
+                cx, cy, nx, ny, dx, dy
+            ).into());
+        }
+        ("Region", "Radial Profile…") => {
+            let aperture: Option<(f64, f64, f64)> = st.active_frame().and_then(|f| {
+                f.selected_marker
+                    .and_then(|i| f.markers.get(i))
+                    .and_then(marker_aperture)
+                    .or_else(|| f.markers.iter().find_map(marker_aperture))
+            });
+            let Some((cx, cy, r)) = aperture else {
+                window.set_status_text(
+                    "radial profile: select a Circle / Ellipse / Annulus region first".into()
+                );
+                return;
+            };
+            let Some(f) = st.active_frame() else { return };
+            let prof = compute_radial_profile(f, cx, cy, r, 40);
+            window.set_radial_image(render_line_plot(&prof, 760, 420));
+            window.set_radial_caption(format!(
+                "RADIAL PROFILE  ({:.1}, {:.1})  r≤{:.1}  {} bins",
+                cx, cy, r, prof.len()
+            ).into());
+            let on = !window.get_radial_visible();
+            window.set_radial_visible(on);
+            window.set_status_text(
+                if on { format!("radial profile: 40 bins, r≤{:.1} px", r).into() }
+                else  { "radial profile: hidden".into() }
+            );
+        }
         ("Region", "Info")   => {
             let msg = match st.active_frame() {
                 Some(f) => {
@@ -2525,6 +2676,8 @@ fn dispatch_ipc(window: &MainWindow, st: &mut State, line: &str) -> String {
         ["crop"]       => { handle_menu(window, st, "Edit", "Crop to Selected"); "ok".into() }
         ["crop", "reset"] => { handle_menu(window, st, "Edit", "Reset Crop"); "ok".into() }
         ["projection"] => { handle_menu(window, st, "Region", "Projection…"); "ok".into() }
+        ["centroid"]   => { handle_menu(window, st, "Region", "Centroid"); "ok".into() }
+        ["radial"]     => { handle_menu(window, st, "Region", "Radial Profile…"); "ok".into() }
         ["hdu", "next"]   => { advance_hdu(window, st); "ok".into() }
         ["hdu", "list"]   => {
             let Some(p) = st.active_frame().and_then(|f| f.source_path.clone())
@@ -2554,7 +2707,7 @@ fn dispatch_ipc(window: &MainWindow, st: &mut State, line: &str) -> String {
                 } else { "err out of bounds".into() }
             } else { "err no frame".into() }
         }
-        ["help"] => "commands: quit | frame next|previous|N | scale S | cmap C | bin N | zoom in|out|fit|N | region load|save P | file open P | save png|fits P | value | sextractor | crop [reset] | projection | hdu next|list|N | movie on|off | help".into(),
+        ["help"] => "commands: quit | frame next|previous|N | scale S | cmap C | bin N | zoom in|out|fit|N | region load|save P | file open P | save png|fits P | value | sextractor | crop [reset] | projection | centroid | radial | hdu next|list|N | movie on|off | help".into(),
         _ => format!("err unknown: {line}"),
     }
 }
