@@ -17,3 +17,12 @@ Thumbs.db
 *.fits.fz
 *.png
 !docs/**/*.png
+
+# LaTeX build artefacts (keep manual.tex + manual.pdf, drop the rest)
+docs/*.aux
+docs/*.log
+docs/*.toc
+docs/*.out
+docs/*.fls
+docs/*.fdb_latexmk
+docs/*.synctex.gz

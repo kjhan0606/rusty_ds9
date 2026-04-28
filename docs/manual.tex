@@ -1,0 +1,824 @@
+% ds9-rust user manual
+% Build: xelatex manual.tex   (or pdflatex; xelatex preferred for the °σ→ glyphs)
+\documentclass[11pt,a4paper]{article}
+
+\usepackage{geometry}
+\geometry{margin=22mm,headheight=24pt}
+
+\usepackage{fontspec}
+% Use widely-available system fonts (fontconfig) so the manual builds on
+% bare TeX Live installs without TeX Gyre / Latin Modern OTF bundles.
+% Pin to the OTF files explicitly — fontconfig matches the t1 (Type 1)
+% Nimbus first, but xdvipdfmx can't embed Type 1 PostScript fonts.
+\setmainfont{NimbusRoman-Regular.otf}[
+  Path           = /usr/share/fonts/urw-base35/,
+  BoldFont       = NimbusRoman-Bold.otf,
+  ItalicFont     = NimbusRoman-Italic.otf,
+  BoldItalicFont = NimbusRoman-BoldItalic.otf,
+]
+\setsansfont{NimbusSans-Regular.otf}[
+  Path           = /usr/share/fonts/urw-base35/,
+  BoldFont       = NimbusSans-Bold.otf,
+  ItalicFont     = NimbusSans-Italic.otf,
+  BoldItalicFont = NimbusSans-BoldItalic.otf,
+]
+\setmonofont{DejaVu Sans Mono}[Scale=0.92]
+
+\usepackage{xcolor}
+\definecolor{accent}{HTML}{1F2D5C}      % deep navy
+\definecolor{accentSoft}{HTML}{4663AD}  % softer navy for rules
+\definecolor{warm}{HTML}{E07A5F}        % coral
+\definecolor{teal}{HTML}{2A9D8F}        % teal
+\definecolor{paper}{HTML}{FAF7F2}       % paper background
+\definecolor{ink}{HTML}{1B1B1F}         % near-black text
+\definecolor{rule}{HTML}{C9C2B6}        % hairline grey
+
+\usepackage[colorlinks=true,
+            linkcolor=accent,
+            urlcolor=teal,
+            citecolor=accent]{hyperref}
+\hypersetup{
+  pdftitle={ds9-rust manual},
+  pdfauthor={ds9-rust contributors},
+  pdfsubject={A Rust + slint port of SAOImage DS9},
+  bookmarksnumbered=true,
+}
+
+\usepackage{titlesec}
+\titleformat{\section}
+  {\Large\sffamily\bfseries\color{accent}}{\thesection}{0.6em}{}
+  [{\color{accentSoft}\titlerule[0.4pt]}]
+\titleformat{\subsection}
+  {\large\sffamily\bfseries\color{accent}}{\thesubsection}{0.5em}{}
+\titleformat{\subsubsection}
+  {\normalsize\sffamily\bfseries\color{accent}}{\thesubsubsection}{0.4em}{}
+
+\usepackage{fancyhdr}
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\textsf{\color{accentSoft}ds9-rust manual}}
+\fancyhead[R]{\textsf{\color{accentSoft}\nouppercase{\leftmark}}}
+\fancyfoot[C]{\textsf{\color{accentSoft}\thepage}}
+\renewcommand{\headrulewidth}{0.4pt}
+\renewcommand{\headrule}{\hbox to\headwidth{\color{rule}\leaders\hrule height \headrulewidth\hfill}}
+
+\usepackage[most]{tcolorbox}
+\tcbset{
+  enhanced,
+  fonttitle=\sffamily\bfseries,
+  boxrule=0.4pt,
+  arc=2pt,
+  left=8pt, right=8pt, top=4pt, bottom=4pt,
+}
+\newtcolorbox{noteb}{colback=accent!4!paper,colframe=accent!50!paper,title={Note}}
+\newtcolorbox{tipb}{colback=teal!6!paper,colframe=teal!55!paper,title={Tip}}
+\newtcolorbox{warnb}{colback=warm!8!paper,colframe=warm!60!paper,title={Heads up}}
+
+\usepackage{listings}
+\lstdefinelanguage{shell}{
+  morekeywords={cargo,echo,nc,ds9,curl,ssh,find,xargs},
+  morecomment=[l]{\#},
+  morestring=[b]",
+}
+\lstdefinelanguage{ipc}{
+  morekeywords={frame,scale,cmap,bin,zoom,region,file,save,value,sextractor,
+                samp,xmlrpc,3d,hdu,movie,help,quit,version,xpaaccess,
+                load,open,png,fits,tiff,eps,wcs,limits,smooth,gaussian,
+                boxcar,median,grey,heat,red,green,blue,rainbow,sls,hsv,cool,a,b,bb,
+                sky,projection,crop,centroid,radial,mosaic,tile,depth,slice,
+                max,sum,mean,resolve,vizier,ned,next,previous,new,delete,clear,
+                in,out,fit,reset,match,blink,composite,rgb},
+  sensitive=true,
+}
+\lstset{
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{accent}\bfseries,
+  commentstyle=\color{teal}\itshape,
+  stringstyle=\color{warm},
+  backgroundcolor=\color{paper!50!white},
+  frame=single,
+  framesep=4pt,
+  rulecolor=\color{rule},
+  showstringspaces=false,
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true,
+  language=shell,
+}
+
+\usepackage{array}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\setlist{nosep,leftmargin=*}
+
+\renewcommand{\arraystretch}{1.15}
+
+% ---- title page ----
+\title{}
+\author{}
+\date{}
+
+\begin{document}
+\pagecolor{paper}
+\color{ink}
+
+\begin{titlepage}
+\centering
+\vspace*{4cm}
+{\sffamily\Huge\bfseries\color{accent} ds9-rust}\\[6pt]
+{\color{accentSoft}\rule{0.45\textwidth}{0.6pt}}\\[14pt]
+{\sffamily\Large User Manual --- v0.1}\\[4pt]
+{\sffamily\large\color{accentSoft} A Rust + slint port of SAOImage DS9}\\[28pt]
+\begin{tcolorbox}[width=0.7\textwidth,
+                  colback=accent!5!paper,colframe=accent!40!paper,
+                  halign=center, boxrule=0.4pt, arc=2pt]
+\sffamily\small
+A pragmatic, OGFinder-style FITS viewer for working astronomers ---\\
+multi-frame, region-aware, WCS-correct, scriptable.
+\end{tcolorbox}
+\vfill
+{\sffamily\small\color{accentSoft}
+Smithsonian Astrophysical Observatory's SAOImage DS9, reimagined in Rust.\\
+\href{https://github.com/kjhan0606/rusty_ds9}{github.com/kjhan0606/rusty\_ds9}\\[4pt]
+This document was typeset with \LaTeX{} (xelatex).}
+\end{titlepage}
+
+\renewcommand{\contentsname}{\sffamily\Large\color{accent} Contents}
+\tableofcontents
+\thispagestyle{empty}
+\clearpage
+
+% ============================================================
+\section{Quick start}
+
+\begin{lstlisting}[language=shell]
+# build (release recommended for large mosaics + smooth / bin)
+cargo build --release -p ds9-app
+
+# launch — open files via the File menu
+./target/release/ds9
+
+# preload an image (with optional region file + catalog)
+./target/release/ds9 deep_field.fits regions.reg sources.cat
+\end{lstlisting}
+
+\begin{noteb}
+The binary is named \texttt{ds9}, not \texttt{ds9-app}. The crate name and
+binary name diverge on purpose --- it lets you alias \texttt{ds9} on your
+\texttt{PATH} without colliding with the upstream Tcl/Tk DS9 if you keep
+both installed.
+\end{noteb}
+
+\paragraph{System requirements.} Rust $\geq$ 1.85, a working OpenGL stack
+(slint defaults to a winit + femtovg backend), and an X11 / Wayland / macOS
+Cocoa display. Optional: \texttt{source-extractor} (or \texttt{sextractor},
+or \texttt{sex}) on \texttt{PATH} for the catalog wrapper; \texttt{lpr} for
+printing.
+
+\subsection{Supported inputs}
+
+\begin{tabular}{>{\sffamily}lp{0.65\textwidth}}
+\toprule
+Image cube  & \texttt{.fits}, \texttt{.fit}, \texttt{.fts},
+              \texttt{.fz} (Rice tile-compressed), NAXIS=2 or NAXIS=3 \\
+Region file & DS9 \texttt{.reg} --- circle / box / ellipse / annulus / point /
+              line / polygon, in \texttt{image} or WCS coordinates
+              (\texttt{fk5} / \texttt{icrs} / \texttt{galactic}) \\
+Catalog     & TSV, whitespace, CSV, SExtractor ASCII\_HEAD,
+              minimal VOTable (\texttt{<TR>/<TD>}) \\
+Colormap    & 256-stop user LUT (text \texttt{R G B} per row, 0--1 or 0--255) \\
+\bottomrule
+\end{tabular}
+
+% ============================================================
+\section{Core concepts}
+
+\paragraph{Frames.} Every loaded image is a \emph{frame}. A frame owns its
+own stretch, limits, colormap, regions, catalog, view zoom \& pan,
+smoothing, binning, orientation, and (for cubes) 3-D projection mode. The
+info bar's \textsc{frm} cell shows \texttt{<active>/<total>}.
+
+\paragraph{The render pipeline} runs in this order, every refresh:
+
+\begin{center}
+\sffamily
+\colorbox{accent!10!paper}{\strut\ bin\ } $\rightarrow$
+\colorbox{accent!10!paper}{\strut\ smooth\ } $\rightarrow$
+\colorbox{accent!10!paper}{\strut\ stretch + limits\ } $\rightarrow$
+\colorbox{accent!10!paper}{\strut\ colormap\ (LUT-aware)\ } $\rightarrow$
+\colorbox{accent!10!paper}{\strut\ orientation\ }
+\end{center}
+
+\paragraph{Coordinates.} Every mouse handler converts display $(x, y)$ to
+FITS pixel $(x_{\text{fits}}, y_{\text{fits}})$ via
+\texttt{display\_to\_fits()} so flips, 180° rotations, and crops never
+leak into region geometry. WCS readouts use a TAN gnomonic projection
+parsed from \texttt{CRPIX/CRVAL/CD\_*}.
+
+% ============================================================
+\section{The window}
+
+\begin{tabular}{@{}>{\sffamily}lp{0.66\textwidth}@{}}
+\toprule
+Menubar      & File / Edit / View / Frame / Bin / Zoom / Scale / Color /
+               Region / Catalog / Analysis / Help. \\
+Mode toggles & \texttt{pan} / \texttt{edit} / \texttt{region} /
+               \texttt{crosshair} (next to the info bar). \\
+Info bar     & cursor x/y, pixel value, WCS readout, frame count, mode. \\
+Sidebar      & catalog table, marker list, optional panner / magnifier. \\
+Canvas       & the image. Drag to pan; click to interact per mode. \\
+Colorbar     & vertical colorbar with the active stretch + limits. \\
+\bottomrule
+\end{tabular}
+
+\subsection{Modes}
+
+\begin{description}[font=\sffamily\bfseries\color{accent}]
+\item[pan]       drag = pan; click on a region selects it.
+\item[edit]      drag = pan or move a region; click empty canvas to drop a
+                 small circle marker.
+\item[region]    click drops the active region template (default circle);
+                 the property editor (Region $\triangleright$ Property)
+                 lets you tune the just-placed region.
+\item[crosshair] click pins a session crosshair in WCS (or pixel) space.
+                 The crosshair follows the active frame: switch frames and
+                 the same on-sky position is re-projected.
+\end{description}
+
+% ============================================================
+\section{Menubar reference}
+
+The menubar is the canonical surface --- every feature is reachable
+without an IPC client.
+
+\subsection{File}
+
+\begin{tabular}{@{}>{\sffamily}lp{0.66\textwidth}@{}}
+\toprule
+Open\dots         & file picker; loads into a new frame. \\
+Save Image\dots   & PNG of the current canvas (after stretch/cmap). \\
+Save FITS\dots    & BITPIX=$-32$ float export with WCS preserved. \\
+Save TIFF\dots    & in-house TIFF writer (no libtiff dep). \\
+Save EPS\dots     & PostScript dump of the colour-mapped raster. \\
+Print\dots        & renders to a temp PNG then \texttt{lpr}'s it. \\
+SAMP Send Image   & broadcasts the current FITS path over SAMP (see \S\ref{sec:samp}). \\
+SAMP Send VOTable & broadcasts a saved VOTable to other SAMP clients. \\
+Quit              & exit. \\
+\bottomrule
+\end{tabular}
+
+\subsection{Edit}
+
+\begin{tabular}{@{}>{\sffamily}lp{0.66\textwidth}@{}}
+\toprule
+Undo / Redo      & not yet --- noop placeholders. \\
+Crop             & sets the visible region of the active frame
+                   (zoom + pan adjusted; original FITS untouched).
+                   \emph{Reset Crop} restores fit. \\
+Preferences\dots & toggles the Preferences panel
+                   (cmap / stretch / limits / smooth / bin / blink-ms).
+                   \texttt{Apply} pushes onto the active frame;
+                   \texttt{Save} persists to
+                   \texttt{\textasciitilde/.config/ds9-rust/prefs.toml}. \\
+\bottomrule
+\end{tabular}
+
+\subsection{View}
+
+Toggles the panner, magnifier, coordinate-grid overlay, crosshair, info
+panel, mode buttons, and colorbar. All toggles persist for the session.
+
+\subsection{Frame}
+
+\begin{tabular}{@{}>{\sffamily}lp{0.66\textwidth}@{}}
+\toprule
+New Frame / Delete Frame & opens picker / removes active. \\
+Next / Previous          & wraps. \\
+Match\dots               & broadcast active frame's view (zoom / pan /
+                            cmap / scale --- per the matching lock) to
+                            siblings. \\
+Blink                    & cycles every 500\,ms. \\
+RGB Composite            & frames 1, 2, 3 $\to$ R, G, B channels of a new
+                            frame. \\
+HDU Movie                & auto-cycles HDUs of the active file every 800\,ms. \\
+Mosaic WCS               & WCS-aware reprojection of all open frames into
+                            one (\S\ref{sec:mosaic}). \\
+Tile Frames              & toggles a grid view of all open frames; click a
+                            tile to make it active. \\
+3D Slice\dots            & for NAXIS=3 cubes: cycles through planes one
+                            click at a time. \\
+3D Max Intensity         & projects max along the cube axis. \\
+3D Sum                   & sum projection. \\
+3D Mean                  & mean projection (NaN-safe). \\
+Rotate 180° / Flip H / Flip V / Reset Orientation & display-time
+                            transforms; coords stay native. \\
+Lock Zoom / Pan / Color / Scale & scope of \texttt{Match\dots} and
+                            \texttt{Blink}. \\
+\bottomrule
+\end{tabular}
+
+\subsection{Bin}
+
+\begin{tabular}{@{}>{\sffamily}lp{0.66\textwidth}@{}}
+\toprule
+1 / 2 / 4 / 8 / 16 / 32        & block-bin factor (active frame). \\
+Average / Sum / Sub-sample     & reduction mode for the bin operator. \\
+\bottomrule
+\end{tabular}
+
+\subsection{Zoom}
+
+In, Out, Fit (canvas), Reset (1:1), or pick a fixed
+$1\times / 2\times / 4\times / 8\times / 16\times$.
+
+\subsection{Scale}
+
+Stretches: \texttt{linear}, \texttt{log}, \texttt{sqrt}, \texttt{squared},
+\texttt{asinh}, \texttt{sinh}.\\
+Limits: \texttt{zscale}, \texttt{minmax}.
+
+\subsection{Color}
+
+Built-in colormaps: \texttt{grey, red, green, blue, a, b, bb, heat, cool,
+rainbow, sls, hsv}. \emph{Load Custom\dots} reads a 256-row LUT
+(\texttt{R G B} text, 0--1 or 0--255); \emph{Clear Custom} drops back to
+the built-in.
+
+\subsection{Region}
+
+New / Load\dots / Save\dots / Delete Selected / Delete All / Info /
+Property\dots (opens the editor for the currently selected region ---
+edit centre, radius, rotation, colour, label, then Apply).
+
+\subsection{Catalog}
+
+Load\dots, Clear, Run SExtractor\dots (\S\ref{sec:sex}), Online Query\dots
+(\S\ref{sec:online}), Info.
+
+\subsection{Analysis}
+
+\begin{tabular}{@{}>{\sffamily}lp{0.66\textwidth}@{}}
+\toprule
+Pixel Table\dots   & 11$\times$11 raw values around the cursor. \\
+Statistics\dots    & frame-wide $N$, min, max, mean, median, $\sigma$,
+                     and finite-pixel count. \\
+Histogram\dots     & 128-bin log-y histogram, computed against the
+                     current stretch limits. \\
+Contour Levels\dots & 5-level overlay (sign-change between zscale low/high). \\
+Smooth (cycle)     & cycles Gaussian $\sigma \in \{0, 2, 4, 8\}$ px. \\
+Smooth Off         & disables. \\
+Smooth Kind\dots   & switches between Gaussian, Boxcar, Median kernels. \\
+Centroid           & flux-weighted $(x, y)$ + half-light radius for the
+                     selected region. \\
+Radial Profile     & 1-D azimuthal profile around the selected region;
+                     opens a floating plot. \\
+Projection         & line-pixel profile for a \emph{line} region. \\
+\bottomrule
+\end{tabular}
+
+% ============================================================
+\section{Mouse \& keyboard}
+
+\begin{tabular}{@{}>{\sffamily}lp{0.66\textwidth}@{}}
+\toprule
+Pan                 & drag (pan mode); arrow keys nudge by 1 canvas pixel. \\
+Zoom                & menu, scroll-wheel, or IPC \texttt{zoom in}/\texttt{out}/N. \\
+Hover readout       & x/y, value, WCS in the info bar. \\
+Select region       & click on it (any mode). \\
+Move region         & edit-mode press-and-drag. \\
+Drop region         & edit-mode click on empty canvas (default circle, $r=6$). \\
+Pick catalog source & click near the symbol or click the row in the table. \\
+Crosshair           & crosshair-mode click (WCS-pinned if frame has WCS). \\
+\bottomrule
+\end{tabular}
+
+% ============================================================
+\section{Working with regions}
+
+DS9 region files are read and written in their canonical form. Image-coord
+regions look like:
+
+\begin{lstlisting}
+# Region file format: DS9 version 4.1
+image
+circle(512.0, 256.5, 18.0) # color=cyan text={hot pixel}
+box(120, 80, 40, 25, 0)
+ellipse(720, 400, 50, 30, 35) # color=yellow
+annulus(960, 540, 8, 20)
+point(160, 160) # point=cross
+line(50, 50, 200, 200) # color=magenta
+polygon(100, 100, 200, 110, 180, 200, 90, 180)
+\end{lstlisting}
+
+\paragraph{Properties carried.} \texttt{color=}, \texttt{width=},
+\texttt{text=\{...\}}, dash, font. The Region $\triangleright$ Property
+dialog edits all of these for the selected region.
+
+% ============================================================
+\section{WCS-aware regions}
+
+When the active frame has a WCS, DS9-style WCS regions load correctly. The
+following all parse:
+
+\begin{lstlisting}
+fk5
+circle(12:34:56.7, +25:18:12, 30")
+ellipse(189.123, 45.678, 1.5', 0.8', 30)
+box(10h12m05s, -27d05'13", 2', 1', 0)
+polygon(189.1, 45.7, 189.15, 45.72, 189.13, 45.78)
+\end{lstlisting}
+
+\paragraph{Sizes.} \texttt{"} = arcsec, \texttt{'} = arcmin, \texttt{d} =
+deg. Decimal-degree numbers without a suffix are also accepted.
+
+\paragraph{No WCS?} The parser falls back to \texttt{image} semantics and
+the status bar warns you so you can spot the silent reinterpretation.
+
+% ============================================================
+\section{Source catalogs}
+
+\paragraph{Auto-detect.} The loader sniffs the first $\sim$256 bytes:
+
+\begin{itemize}
+\item \texttt{<VOTABLE>} or \texttt{<TABLE>} \,$\to$\, VOTable parser.
+\item Leading \texttt{\#} on first non-blank line \,$\to$\, SExtractor.
+\item Tab in the first row \,$\to$\, TSV (header row).
+\item Comma in the first row \,$\to$\, CSV (header row, quoted strings OK).
+\item Otherwise \,$\to$\, whitespace-separated, columns synthesised
+      (\texttt{col1, col2, \dots}).
+\end{itemize}
+
+\paragraph{X / Y mapping.} The catalog overlay needs image coords. The
+loader looks up \texttt{X\_IMAGE/Y\_IMAGE} (SExtractor), falling back to
+\texttt{XWIN\_IMAGE/YWIN\_IMAGE}, then bare \texttt{X/Y} or \texttt{x/y}.
+
+\subsection{Run SExtractor}\label{sec:sex}
+
+\textsf{Catalog $\triangleright$ Run SExtractor\dots} shells out to the
+external SExtractor binary on the active frame's source FITS, parses
+\texttt{ASCII\_HEAD} output, and overlays the result. Defaults:
+\texttt{DETECT\_THRESH=1.5}, \texttt{DETECT\_MINAREA=5},
+\texttt{BACK\_SIZE=64}. Override per-key via \texttt{SEXTRACTOR\_OPTS}:
+
+\begin{lstlisting}[language=shell]
+SEXTRACTOR_OPTS="-DETECT_THRESH 3.0 -DEBLEND_MINCONT 0.0001" \
+  ./target/release/ds9 image.fits
+\end{lstlisting}
+
+The IPC verb \texttt{sextractor} runs the same code path.
+
+\subsection{Online query}\label{sec:online}
+
+\textsf{Catalog $\triangleright$ Online Query\dots} opens a small panel
+with three buttons:
+
+\begin{tabular}{@{}>{\sffamily}lp{0.66\textwidth}@{}}
+\toprule
+Resolve & SIMBAD/Sesame name $\to$ (RA, Dec). Recenters the active frame
+          on the resolved position; drops a crosshair. \\
+VizieR  & cone search around the cursor / crosshair (radius in arcmin).
+          Result loads as a VOTable catalog. \\
+NED     & NED \texttt{objsearch} cone search (returns a bar-separated
+          ASCII table). \\
+\bottomrule
+\end{tabular}
+
+All requests use HTTPS via \texttt{ureq + rustls} (no system OpenSSL).
+
+% ============================================================
+\section{Multi-frame, Match, Blink, RGB}
+
+Every \textsf{File $\triangleright$ Open\dots} pushes a new frame.
+\textsf{Frame $\triangleright$ Next / Previous} cycles them; per-frame
+view state (zoom, pan, stretch, limits, cmap, regions, catalog, smooth,
+bin) is saved on switch and restored when you come back.
+
+\paragraph{Match.} Broadcasts the active frame's state to siblings. The
+\textsf{Lock Zoom / Pan / Color / Scale} toggles control which channels
+are pushed. \texttt{Lock Color} pushes both built-in cmaps and any custom
+LUT.
+
+\paragraph{Blink.} Cycles all frames every 500\,ms. Combine with
+\texttt{Lock Pan} for true side-by-side comparison.
+
+\paragraph{RGB Composite.} \textsf{Frame $\triangleright$ RGB Composite}
+takes frames 1--3 (whichever are loaded), zscale-stretches each, packs
+them into the R/G/B channels of a new frame, and pushes it onto the
+stack. Useful for tri-band difference imaging.
+
+\subsection{Mosaic WCS}\label{sec:mosaic}
+
+\textsf{Frame $\triangleright$ Mosaic WCS} reprojects every open frame
+that has a WCS into a single output frame. The output WCS is the first
+WCS-bearing frame's, shifted to span the bounding box of all corners.
+The reprojector uses output-driven nearest-neighbour:
+$\text{world}(out) \to \text{pix}(in)$ for each output pixel. Overlap is
+averaged. Frames without a WCS are skipped (with a warning).
+
+\subsection{Tile Frames}
+
+Toggles a grid view of all open frames (cols $= \lceil\sqrt{n}\rceil$).
+Each tile is a per-frame RGBA composite scaled with aspect preservation.
+Click any tile to switch to that frame and exit tile mode.
+
+% ============================================================
+\section{Filters: smoothing \& binning}
+
+\paragraph{Smoothing.} Gaussian, Boxcar, or Median kernel; per-frame.
+\textsf{Analysis $\triangleright$ Smooth (cycle)} steps Gaussian
+$\sigma$ through $0 \to 2 \to 4 \to 8$ px. \textsf{Smooth Off} resets.
+\textsf{Smooth Kind\dots} switches kernel.
+
+\paragraph{Binning.} \textsf{Bin $\triangleright$ N} block-bins the
+displayed image $N \times N$. \textsf{Bin $\triangleright$
+Average / Sum / Sub-sample} picks the reduction. Visualisation only --- the
+underlying FITS pixel grid and WCS are untouched.
+
+% ============================================================
+\section{3-D cube rendering}
+
+When the active frame loaded a NAXIS=3 cube, the full plane stack is held
+on the side; the 2-D display starts on plane 1. Use the \textsf{Frame}
+menu's 3D entries to project:
+
+\begin{tabular}{@{}>{\sffamily}lp{0.66\textwidth}@{}}
+\toprule
+3D Slice\dots      & each click advances to the next plane (with wrap).
+                     IPC \texttt{3d slice N} sets a specific 1-based index. \\
+3D Max Intensity   & per-pixel max along the cube axis (NaN-safe). \\
+3D Sum             & per-pixel sum (skips NaN). \\
+3D Mean            & per-pixel mean (skips NaN, divisor is finite count). \\
+\bottomrule
+\end{tabular}
+
+The chosen mode is sticky on the frame --- smoothing, binning, stretch,
+and cmap all run downstream of the projection.
+
+% ============================================================
+\section{Analysis tools}
+
+\subsection{Statistics}
+Frame-wide finite count, $\min / \max$, mean, median, $\sigma$.
+
+\subsection{Histogram}
+128-bin, log-$y$, computed against the current stretch limits.
+
+\subsection{Contour overlay}
+5 levels via sign-change detection between zscale low/high. Re-rendered
+on every refresh; orientation-aware.
+
+\subsection{Pixel table}
+$11 \times 11$ raw pixel values centred on the cursor.
+
+\subsection{Centroid}
+Flux-weighted centroid plus a rough half-light radius for the selected
+region (typically a circle / box / ellipse).
+
+\subsection{Radial profile}
+Azimuthally averaged 1-D profile, drawn in a floating plot window.
+
+\subsection{Projection}
+For a \emph{line} region, samples the pixel values along the line and
+plots them. Useful for slit-style profile checks.
+
+\subsection{Crop}
+\textsf{Edit $\triangleright$ Crop} sets the active frame's visible region
+to the current view. \textsf{Reset Crop} returns to a full-frame fit. The
+underlying FITS image is never modified.
+
+% ============================================================
+\section{Saving, exporting, printing}
+
+\begin{tabular}{@{}>{\sffamily}lp{0.66\textwidth}@{}}
+\toprule
+Save Image\dots & PNG of the current canvas (RGBA, alpha untouched). \\
+Save FITS\dots  & BITPIX=$-32$, WCS keywords preserved, BSCALE=1 / BZERO=0. \\
+Save TIFF\dots  & in-house writer; no libtiff. \\
+Save EPS\dots   & PostScript dump of the colour-mapped raster. \\
+Save JPEG\dots  & not built in (returns a status message). \\
+Print\dots      & renders to a temp PNG, then pipes via \texttt{lpr}. \\
+\bottomrule
+\end{tabular}
+
+% ============================================================
+\section{IPC protocol}\label{sec:ipc}
+
+ds9-rust ships a line-based, XPA-flavoured IPC protocol. Two transports
+listen by default:
+
+\begin{itemize}
+\item Unix-domain socket at
+      \texttt{\$XDG\_RUNTIME\_DIR/ds9-rust-\$USER.sock}
+      (or \texttt{/tmp/\dots} on macOS).
+\item TCP loopback on a dynamic port (e.g. \texttt{127.0.0.1:54861}).
+\end{itemize}
+
+The chosen paths/ports are written to
+\texttt{\textasciitilde/.ds9-rust/xpa.info} so external clients can
+discover them:
+
+\begin{lstlisting}
+pid=12345
+unix=/run/user/1000/ds9-rust-alice.sock
+tcp=54861
+\end{lstlisting}
+
+\subsection{Verb grammar}
+
+\begin{tabular}{@{}>{\sffamily}lp{0.62\textwidth}@{}}
+\toprule
+quit, exit                & terminate. \\
+xpaaccess, version        & XPA-style probes. \\
+mode M                    & set window mode (pan / edit / region / crosshair). \\
+frame N, frame next/prev  & switch frame. \\
+frame new / delete        & menu equivalents. \\
+frame mosaic / tile       & menu equivalents. \\
+scale linear|log|sqrt|... & set stretch. \\
+scale limits LO HI        & set user limits. \\
+cmap NAME                 & switch built-in colormap. \\
+bin N                     & block-bin factor. \\
+zoom in|out|fit|reset|N   & view zoom. \\
+pan to X Y                & pan in image coords. \\
+region load / save PATH   & DS9 .reg I/O. \\
+file open PATH            & load a FITS file (new frame). \\
+save png|fits|tiff|eps P  & export. \\
+value                     & emit the pixel value at the current cursor. \\
+sextractor                & run the SExtractor wrapper. \\
+samp image / votable PATH & broadcast over SAMP. \\
+hdu next / list / N       & HDU navigator. \\
+movie on / off            & toggle HDU movie. \\
+3d max / sum / mean       & cube projection. \\
+3d slice N                & cube slice index (1-based). \\
+3d depth                  & query cube depth. \\
+help                      & one-line summary. \\
+\bottomrule
+\end{tabular}
+
+\subsection{Examples}
+
+\begin{lstlisting}[language=shell]
+SOCK=$(awk -F= '/^unix=/{print $2}' ~/.ds9-rust/xpa.info)
+
+echo "frame next"             | nc -U "$SOCK"
+echo "scale log"              | nc -U "$SOCK"
+echo "cmap heat"              | nc -U "$SOCK"
+echo "region load /tmp/x.reg" | nc -U "$SOCK"
+echo "save png /tmp/out.png"  | nc -U "$SOCK"
+echo "3d max"                 | nc -U "$SOCK"
+echo "3d slice 12"            | nc -U "$SOCK"
+echo "value"                  | nc -U "$SOCK"
+echo "help"                   | nc -U "$SOCK"
+\end{lstlisting}
+
+The TCP transport accepts the same grammar:
+
+\begin{lstlisting}[language=shell]
+PORT=$(awk -F= '/^tcp=/{print $2}' ~/.ds9-rust/xpa.info)
+echo "version" | nc 127.0.0.1 "$PORT"
+\end{lstlisting}
+
+\begin{warnb}
+TCP listens only on \texttt{127.0.0.1}. Don't expose ds9-rust on a
+public interface --- there's no auth on the IPC channel.
+\end{warnb}
+
+% ============================================================
+\section{SAMP messaging}\label{sec:samp}
+
+\textsf{File $\triangleright$ SAMP Send Image / VOTable} broadcasts the
+current FITS path (or a saved VOTable) to other SAMP clients running on
+the same desktop --- TOPCAT, Aladin, etc.
+
+\paragraph{How it works.} ds9-rust reads the standard SAMP lockfile at
+\texttt{\textasciitilde/.samp}, registers a client with the hub via
+XML-RPC, then sends \texttt{samp.hub.notifyAll} with the canonical
+\texttt{image.load.fits} or \texttt{table.load.votable} mtype. The XML-RPC
+serialiser is hand-rolled (no SOAP / glib dep). On exit the client
+unregisters cleanly.
+
+\paragraph{Caveats.} Outbound only; ds9-rust does not currently subscribe
+to incoming SAMP messages.
+
+% ============================================================
+\section{Preferences}
+
+\textsf{Edit $\triangleright$ Preferences\dots} toggles a panel. Editable:
+default colormap / stretch / limits / smoothing string / bin factor /
+blink interval (ms). Buttons:
+
+\begin{itemize}
+\item \textbf{Apply} --- push onto the active frame.
+\item \textbf{Save}  --- persist to \texttt{\textasciitilde/.config/ds9-rust/prefs.toml}
+       (a simple \texttt{key = value} text file, not real TOML).
+\item \textbf{Reset} --- restore built-in defaults.
+\end{itemize}
+
+The prefs file is loaded automatically at startup; new frames inherit
+those defaults.
+
+% ============================================================
+\section{Cookbook}
+
+\subsection*{Open a deep-field stack and bring up SExtractor sources}
+
+\begin{lstlisting}[language=shell]
+./target/release/ds9 deep_field.fits
+# Catalog -> Run SExtractor...   (uses defaults; tweak SEXTRACTOR_OPTS if needed)
+# Click a star on the image -> table jumps; click a row -> view recenters.
+\end{lstlisting}
+
+\subsection*{RGB difference image from three exposures}
+
+\begin{lstlisting}[language=shell]
+SOCK=$(awk -F= '/^unix=/{print $2}' ~/.ds9-rust/xpa.info)
+echo "file open r.fits" | nc -U "$SOCK"
+echo "file open g.fits" | nc -U "$SOCK"
+echo "file open b.fits" | nc -U "$SOCK"
+echo "frame 1; cmap red"   | nc -U "$SOCK"
+echo "frame 2; cmap green" | nc -U "$SOCK"
+echo "frame 3; cmap blue"  | nc -U "$SOCK"
+# Frame -> RGB Composite  (creates a new packed frame)
+\end{lstlisting}
+
+\subsection*{Walk through a spectral cube}
+
+\begin{lstlisting}[language=shell]
+./target/release/ds9 cube.fits
+# Frame -> 3D Slice...   (each click advances)
+# Or via IPC:
+echo "3d slice 17" | nc -U "$SOCK"
+echo "3d max"      | nc -U "$SOCK"   # then back to a max-intensity view
+\end{lstlisting}
+
+\subsection*{Mosaic four CCD chips into one frame}
+
+\begin{lstlisting}[language=shell]
+./target/release/ds9 chip1.fits chip2.fits chip3.fits chip4.fits
+# Frame -> Mosaic WCS
+# (output frame uses chip1's WCS, shifted to fit all chip corners)
+\end{lstlisting}
+
+% ============================================================
+\section{Troubleshooting}
+
+\begin{tabular}{@{}p{0.4\textwidth}p{0.55\textwidth}@{}}
+\toprule
+\textsf{No matching fbConfigs / GLXBadFBConfig} on launch &
+slint's OpenGL backend can't find a config. Try
+\texttt{SLINT\_BACKEND=software ./target/release/ds9}, or update Mesa /
+your GPU driver. \\
+\textsf{RefCell already borrowed} when opening a file dialog (macOS) &
+fixed in 4fa677f. If you're on an older build, pull \texttt{main}. \\
+\textsf{file contains no 2-D image HDU} &
+The file is a pure binary table or its primary HDU has \texttt{NAXIS=0}.
+Use \textsf{Frame $\triangleright$ HDU Movie} or the HDU navigator
+(sidebar) to step through extensions. \\
+\textsf{tile-compressed .fz precision loss} &
+Make sure the workspace \texttt{[patch.crates-io]} for vendored
+\texttt{fitsrs} is intact. The patch upgrades unquantize to f64. \\
+\textsf{SAMP Send Image silently does nothing} &
+No SAMP hub running; start TOPCAT or Aladin first. \\
+\bottomrule
+\end{tabular}
+
+% ============================================================
+\section{Architecture}
+
+\begin{tabular}{@{}>{\sffamily}lp{0.66\textwidth}@{}}
+\toprule
+ds9-app     & slint UI shell; all event wiring; menubar handler;
+              frame / state management; IPC dispatch;
+              mosaic + tile + 3D + SAMP + online-query glue. \\
+ds9-fits    & FITS I/O wrapping vendored \texttt{fitsrs}; BITPIX
+              8/16/32/$-32$/$-64$, BSCALE/BZERO/BLANK; tile-compressed
+              \texttt{.fz}; minimal TAN-projection WCS; NAXIS=3 cube
+              loader. \\
+ds9-image   & stretches (linear/log/sqrt/squared/asinh/sinh), limits
+              (zscale/minmax), built-in + custom colormaps, RGBA
+              renderer, smoothing kernels, block-bin operators. \\
+ds9-marker  & DS9 \texttt{.reg} parser/writer + region/marker model
+              (image-coord shapes, with WCS round-trip handled by
+              ds9-app). \\
+ds9-catalog & TSV / SExtractor / CSV / VOTable parsers, column lookup,
+              numeric sort. \\
+vendor/fitsrs & local \texttt{fitsrs} patch (f64 unquantize for
+              \texttt{.fz}). \\
+\bottomrule
+\end{tabular}
+
+\paragraph{Persistent files} written by ds9-rust:
+
+\begin{itemize}
+\item \texttt{\textasciitilde/.config/ds9-rust/prefs.toml} --- preferences.
+\item \texttt{\textasciitilde/.ds9-rust/xpa.info} --- IPC discovery
+      (pid, unix socket path, tcp port).
+\end{itemize}
+
+\vfill
+\begin{center}
+\sffamily\small\color{accentSoft}
+ds9-rust 0.1 --- MIT OR Apache-2.0 --- Smithsonian Astrophysical
+Observatory's SAOImage DS9, in Rust.
+\end{center}
+
+\end{document}
