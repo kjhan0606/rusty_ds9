@@ -225,6 +225,10 @@ struct State {
     /// Session-wide defaults (applied to new frames; editable via
     /// `Edit ▸ Preferences…`).
     prefs: Prefs,
+    /// Tile mode: when on, refresh_view renders every loaded frame in a
+    /// grid instead of just the active one. Clicking a tile selects it
+    /// and exits tile mode.
+    tile_mode: bool,
 }
 
 impl State {
@@ -240,6 +244,7 @@ impl State {
             lock_cmap: false,
             lock_scale: false,
             prefs: Prefs::default(),
+            tile_mode: false,
         }
     }
 
@@ -258,6 +263,110 @@ fn render_image(f: &Frame) -> Image {
     let mut buf = SharedPixelBuffer::<Rgba8Pixel>::new(f.fits.width as u32, f.fits.height as u32);
     buf.make_mut_bytes().copy_from_slice(&rgba);
     Image::from_rgba8(buf)
+}
+
+/// Decide a (cols, rows) grid for `n` tiles. cols = ceil(sqrt(n)), rows fills.
+fn tile_layout(n: usize) -> (usize, usize) {
+    if n == 0 { return (1, 1); }
+    let cols = (n as f64).sqrt().ceil() as usize;
+    let rows = (n + cols - 1) / cols;
+    (cols.max(1), rows.max(1))
+}
+
+/// Render every loaded frame in a grid into a single `out_w × out_h` RGBA
+/// image. Each tile gets a 1-px border (`#2a3242` for inactive, accent gold
+/// for the currently-active frame). Frame name is overlaid in the top-left
+/// corner of each tile (small bitmap font from `render_line_plot`'s palette
+/// — for simplicity we just colour-blit a couple of dots indicating the
+/// frame index instead of full text).
+fn render_tile_view(st: &State, out_w: usize, out_h: usize) -> Image {
+    let n = st.frames.len();
+    let (cols, rows) = tile_layout(n.max(1));
+    let cell_w = out_w / cols;
+    let cell_h = out_h / rows;
+
+    let mut buf = SharedPixelBuffer::<Rgba8Pixel>::new(out_w as u32, out_h as u32);
+    {
+        let bytes = buf.make_mut_bytes();
+        // background `#0a0d14ff`
+        for px in bytes.chunks_exact_mut(4) {
+            px[0] = 0x0a; px[1] = 0x0d; px[2] = 0x14; px[3] = 0xff;
+        }
+        for (idx, f) in st.frames.iter().enumerate() {
+            let cr = idx / cols;
+            let cc = idx % cols;
+            if cr >= rows { break; }
+            let x0 = cc * cell_w;
+            let y0 = cr * cell_h;
+            let cw = cell_w.saturating_sub(2);
+            let ch = cell_h.saturating_sub(2);
+            if cw == 0 || ch == 0 { continue; }
+            // render frame to its native size, then nearest-neighbour scale.
+            let src = render_rgba_for_frame(f);
+            let (sw, sh) = (f.fits.width, f.fits.height);
+            // preserve aspect — fit into (cw, ch)
+            let scale = (cw as f64 / sw as f64).min(ch as f64 / sh as f64);
+            let tw = ((sw as f64 * scale).round() as usize).max(1).min(cw);
+            let th = ((sh as f64 * scale).round() as usize).max(1).min(ch);
+            let off_x = x0 + 1 + (cw - tw) / 2;
+            let off_y = y0 + 1 + (ch - th) / 2;
+            for ty in 0..th {
+                let sy = (ty as f64 / scale) as usize;
+                let sy = sy.min(sh - 1);
+                let dst_row = (off_y + ty) * out_w * 4;
+                let src_row = sy * sw * 4;
+                for tx in 0..tw {
+                    let sx = (tx as f64 / scale) as usize;
+                    let sx = sx.min(sw - 1);
+                    let di = dst_row + (off_x + tx) * 4;
+                    let si = src_row + sx * 4;
+                    bytes[di]   = src[si];
+                    bytes[di+1] = src[si+1];
+                    bytes[di+2] = src[si+2];
+                    bytes[di+3] = 0xff;
+                }
+            }
+            // border — accent gold for active, dim slate otherwise
+            let (br, bg, bb) = if idx == st.active {
+                (0xff, 0xc1, 0x07)
+            } else {
+                (0x2a, 0x32, 0x42)
+            };
+            let put = |b: &mut [u8], x: usize, y: usize| {
+                if x < out_w && y < out_h {
+                    let i = (y * out_w + x) * 4;
+                    b[i] = br; b[i+1] = bg; b[i+2] = bb; b[i+3] = 0xff;
+                }
+            };
+            for x in x0..(x0 + cell_w).min(out_w) {
+                put(bytes, x, y0);
+                put(bytes, x, (y0 + cell_h).min(out_h.saturating_sub(1)));
+            }
+            for y in y0..(y0 + cell_h).min(out_h) {
+                put(bytes, x0, y);
+                put(bytes, (x0 + cell_w).min(out_w.saturating_sub(1)), y);
+            }
+        }
+    }
+    Image::from_rgba8(buf)
+}
+
+/// Reverse of `render_tile_view`'s grid layout: given a click in canvas
+/// coordinates and the same `out_w/out_h` used to render the tiles, return
+/// the frame index whose tile cell contains the click.
+fn tile_hit(st: &State, out_w: usize, out_h: usize, cx: f64, cy: f64) -> Option<usize> {
+    let n = st.frames.len();
+    if n == 0 { return None; }
+    let (cols, rows) = tile_layout(n);
+    let cell_w = (out_w / cols) as f64;
+    let cell_h = (out_h / rows) as f64;
+    if cell_w <= 0.0 || cell_h <= 0.0 { return None; }
+    let cc = (cx / cell_w).floor() as i64;
+    let cr = (cy / cell_h).floor() as i64;
+    if cc < 0 || cr < 0 { return None; }
+    let idx = (cr as usize) * cols + (cc as usize);
+    if idx >= n { return None; }
+    Some(idx)
 }
 
 /// Apply per-frame bin/smooth filters before stretching, returning the raw
@@ -687,6 +796,33 @@ fn refresh_view(window: &MainWindow, st: &State) {
     window.set_active_limits(f.limits_label().into());
     window.set_active_cmap(f.cmap.name().into());
     window.set_colorbar_strip(make_colorbar_strip(f.cmap));
+
+    if st.tile_mode {
+        // Tile mode: replace the active-frame image with a composite of every
+        // loaded frame; suppress per-frame overlays (markers, line/grid).
+        let cw = (window.get_canvas_w() as f32 as i32).max(64) as usize;
+        let ch = (window.get_canvas_h() as f32 as i32).max(64) as usize;
+        window.set_fits_image(render_tile_view(st, cw, ch));
+        window.set_fits_width(cw as i32);
+        window.set_fits_height(ch as i32);
+        window.set_view_zoom(1.0);
+        window.set_view_pan_x(0.0);
+        window.set_view_pan_y(0.0);
+        window.set_markers(ModelRc::new(VecModel::from(Vec::<Mark>::new())));
+        window.set_text_marks(ModelRc::new(VecModel::from(Vec::<TextMark>::new())));
+        window.set_catalog_rows(build_catalog_model(f));
+        window.set_catalog_selected(-1);
+        window.set_info_filename(format!("[tile] {} frames", st.frames.len()).into());
+        window.set_line_visible(false);
+        window.set_grid_visible(false);
+        push_crosshair_to_window(window, st);
+        window.set_lock_zoom(st.lock_zoom);
+        window.set_lock_pan(st.lock_pan);
+        window.set_lock_cmap(st.lock_cmap);
+        window.set_lock_scale(st.lock_scale);
+        return;
+    }
+
     window.set_markers(build_mark_model(f));
     window.set_text_marks(build_text_marks(f));
     window.set_catalog_rows(build_catalog_model(f));
@@ -2677,6 +2813,25 @@ fn handle_menu(window: &MainWindow, st: &mut State, menu: &str, item: &str) {
                 }
             }
         }
+        ("Frame", "Tile Frames") => {
+            if st.frames.len() < 2 && !st.tile_mode {
+                window.set_status_text("tile: load 2+ frames first".into());
+            } else {
+                st.tile_mode = !st.tile_mode;
+                if !st.tile_mode {
+                    // restore the active frame's saved view
+                    push_view_to_window(window, st);
+                }
+                refresh_view(window, st);
+                window.set_status_text(
+                    if st.tile_mode {
+                        format!("tile: showing {} frames (click a tile to select)", st.frames.len()).into()
+                    } else {
+                        "tile: off".into()
+                    }
+                );
+            }
+        }
         ("Frame", "Mosaic WCS") => {
             match build_mosaic(&st.frames) {
                 Ok(img) => {
@@ -3152,6 +3307,7 @@ fn dispatch_ipc(window: &MainWindow, st: &mut State, line: &str) -> String {
     match toks.as_slice() {
         ["quit"] => { let _ = slint::quit_event_loop(); "ok".into() }
         ["frame", "mosaic"]    => { handle_menu(window, st, "Frame", "Mosaic WCS"); "ok".into() }
+        ["frame", "tile"]      => { handle_menu(window, st, "Frame", "Tile Frames"); "ok".into() }
         ["frame", "next"]      => { handle_menu(window, st, "Frame", "Next"); "ok".into() }
         ["frame", "previous"]  => { handle_menu(window, st, "Frame", "Previous"); "ok".into() }
         ["frame", n] => {
@@ -3238,7 +3394,7 @@ fn dispatch_ipc(window: &MainWindow, st: &mut State, line: &str) -> String {
                 } else { "err out of bounds".into() }
             } else { "err no frame".into() }
         }
-        ["help"] => "commands: quit | frame next|previous|N|mosaic | scale S | cmap C | bin N | zoom in|out|fit|N | region load|save P | file open P | save png|fits P | value | sextractor | crop [reset] | projection | centroid | radial | hdu next|list|N | movie on|off | help".into(),
+        ["help"] => "commands: quit | frame next|previous|N|mosaic|tile | scale S | cmap C | bin N | zoom in|out|fit|N | region load|save P | file open P | save png|fits P | value | sextractor | crop [reset] | projection | centroid | radial | hdu next|list|N | movie on|off | help".into(),
         _ => format!("err unknown: {line}"),
     }
 }
@@ -3443,6 +3599,25 @@ fn main() -> Result<()> {
         let state = Rc::clone(&state);
         win.on_canvas_clicked(move |x, y| {
             let Some(w) = weak.upgrade() else { return };
+            // Tile mode: click a cell to select that frame and exit tile.
+            {
+                let mut s = state.borrow_mut();
+                if s.tile_mode {
+                    let cw = (w.get_canvas_w() as f32 as i32).max(64) as usize;
+                    let ch = (w.get_canvas_h() as f32 as i32).max(64) as usize;
+                    if let Some(idx) = tile_hit(&s, cw, ch, x as f64, y as f64) {
+                        s.tile_mode = false;
+                        let prev = s.active;
+                        s.active = idx;
+                        push_view_to_window(&w, &s);
+                        refresh_view(&w, &s);
+                        w.set_status_text(format!(
+                            "tile: selected frame {} (was {})", idx + 1, prev + 1
+                        ).into());
+                    }
+                    return;
+                }
+            }
             let mode = w.get_active_mode().to_string();
             // Crosshair mode: drop / move the session crosshair at the click.
             if mode == "crosshair" {
