@@ -1,6 +1,6 @@
 use anyhow::Result;
 use ds9_fits::FitsImage;
-use ds9_image::{Colormap, Limits, Stretch};
+use ds9_image::{Colormap, Limits, Orientation, Stretch};
 use ds9_catalog::Catalog;
 use ds9_marker::{Marker, Shape as MShape};
 use slint::{ComponentHandle, Image, ModelRc, Rgba8Pixel, SharedPixelBuffer, VecModel};
@@ -8,6 +8,54 @@ use std::cell::RefCell;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+
+/// Smoothing kernel choice. Gaussian is parameterised by `sigma`; Boxcar /
+/// Median by an odd window size in pixels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SmoothKind {
+    Gaussian { sigma: f32 },
+    Boxcar   { n: u32 },
+    Median   { n: u32 },
+}
+
+impl Default for SmoothKind {
+    fn default() -> Self { SmoothKind::Gaussian { sigma: 0.0 } }
+}
+
+impl SmoothKind {
+    fn label(self) -> String {
+        match self {
+            SmoothKind::Gaussian { sigma } => {
+                if sigma <= 0.0 { "off".into() } else { format!("gaussian σ={sigma:.1}") }
+            }
+            SmoothKind::Boxcar { n } => {
+                if n <= 1 { "off".into() } else { format!("boxcar {n}×{n}") }
+            }
+            SmoothKind::Median { n } => {
+                if n <= 1 { "off".into() } else { format!("median {n}×{n}") }
+            }
+        }
+    }
+}
+
+/// Block-bin reduction mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum BinMode {
+    #[default]
+    Average,
+    Sum,
+    Subsample,
+}
+
+impl BinMode {
+    fn label(self) -> &'static str {
+        match self {
+            BinMode::Average   => "average",
+            BinMode::Sum       => "sum",
+            BinMode::Subsample => "sub-sample",
+        }
+    }
+}
 
 slint::include_modules!();
 
@@ -41,10 +89,25 @@ struct Frame {
     view_zoom: f32,
     view_pan_x: f32,
     view_pan_y: f32,
-    /// Gaussian-smooth kernel σ in pixels (0 = off).
+    /// Gaussian-smooth kernel σ in pixels (0 = off). Kept for IPC back-compat
+    /// with the cycle-through `smooth (cycle)` action; the kernel choice itself
+    /// lives on `smooth_kind`.
     smooth_sigma: f32,
+    /// Active smoothing kernel (Gaussian / Boxcar / Median).
+    smooth_kind: SmoothKind,
     /// Block-bin factor (1 = off, 2/4/8/16/32 chunkify).
     bin_factor: u32,
+    /// Block-bin reduction mode (Average / Sum / Subsample).
+    bin_mode: BinMode,
+    /// Display-time image orientation (no-op = `Identity`).
+    orientation: Orientation,
+    /// Optional user colormap loaded via `Color ▸ Load Custom…` — overrides
+    /// `cmap` when present.
+    custom_lut: Option<Box<[[u8; 3]; 256]>>,
+    /// Disk path this frame was loaded from + the HDU index (0 = primary).
+    /// Used by the HDU navigator dialog so we can re-load a different HDU
+    /// without the user having to re-pick the file.
+    hdu_idx: usize,
 }
 
 impl Frame {
@@ -65,7 +128,12 @@ impl Frame {
             view_pan_x: 0.0,
             view_pan_y: 0.0,
             smooth_sigma: 0.0,
+            smooth_kind: SmoothKind::default(),
             bin_factor: 1,
+            bin_mode: BinMode::default(),
+            orientation: Orientation::Identity,
+            custom_lut: None,
+            hdu_idx: 0,
         }
     }
 
@@ -98,6 +166,17 @@ impl Frame {
     }
 }
 
+/// Session-level crosshair. Pinned in world space when the frame the crosshair
+/// was placed in had a WCS, otherwise pinned to that frame's pixel grid.
+/// On render, the active frame projects this back into its own pixel space
+/// (via `wcs.world_to_pix` if both world+wcs are available).
+struct Crosshair {
+    /// (RA, Dec) in degrees if the placing frame had a WCS.
+    world: Option<(f64, f64)>,
+    /// (frame_idx, x_fits, y_fits) — fallback when no WCS available.
+    pixel: (usize, f64, f64),
+}
+
 struct State {
     frames: Vec<Frame>,
     /// Index into `frames`; only meaningful when `frames` is non-empty.
@@ -105,6 +184,13 @@ struct State {
     /// index into the active frame's markers (transient, not per-frame state)
     dragging_marker: Option<usize>,
     last_drag_fits: Option<(f64, f64)>,
+    crosshair: Option<Crosshair>,
+    /// Frame-lock toggles. When on, changes to the active frame are
+    /// broadcast to every other loaded frame.
+    lock_zoom:  bool,
+    lock_pan:   bool,
+    lock_cmap:  bool,
+    lock_scale: bool,
 }
 
 impl State {
@@ -114,6 +200,11 @@ impl State {
             active: 0,
             dragging_marker: None,
             last_drag_fits: None,
+            crosshair: None,
+            lock_zoom: false,
+            lock_pan: false,
+            lock_cmap: false,
+            lock_scale: false,
         }
     }
 
@@ -139,19 +230,40 @@ fn render_image(f: &Frame) -> Image {
 fn render_rgba_for_frame(f: &Frame) -> Vec<u8> {
     let mut owned: Option<FitsImage> = None;
     if f.bin_factor > 1 {
-        owned = Some(ds9_image::bin_average(&f.fits, f.bin_factor));
+        owned = Some(match f.bin_mode {
+            BinMode::Average   => ds9_image::bin_average(&f.fits, f.bin_factor),
+            BinMode::Sum       => ds9_image::bin_sum(&f.fits, f.bin_factor),
+            BinMode::Subsample => ds9_image::bin_subsample(&f.fits, f.bin_factor),
+        });
     }
-    if f.smooth_sigma > 0.0 {
-        let src = owned.as_ref().unwrap_or(&f.fits);
-        owned = Some(ds9_image::smooth_gaussian(src, f.smooth_sigma));
-    }
+    let smoothed = match f.smooth_kind {
+        SmoothKind::Gaussian { sigma } if sigma > 0.0 => Some(ds9_image::smooth_gaussian(
+            owned.as_ref().unwrap_or(&f.fits), sigma,
+        )),
+        SmoothKind::Boxcar { n } if n > 1 => Some(ds9_image::smooth_boxcar(
+            owned.as_ref().unwrap_or(&f.fits), n,
+        )),
+        SmoothKind::Median { n } if n > 1 => Some(ds9_image::smooth_median(
+            owned.as_ref().unwrap_or(&f.fits), n,
+        )),
+        _ => None,
+    };
+    if smoothed.is_some() { owned = smoothed; }
     let img: &FitsImage = owned.as_ref().unwrap_or(&f.fits);
     let limits = match f.limits_mode {
         LimitsMode::Zscale => Limits::zscale(img),
         LimitsMode::MinMax => Limits::minmax(img),
         LimitsMode::User { low, high } => Limits { low, high },
     };
-    ds9_image::render_rgba_flipped(img, limits, f.stretch, f.cmap)
+    let mut rgba = if let Some(lut) = &f.custom_lut {
+        ds9_image::render_rgba_flipped_with_lut(img, limits, f.stretch, lut)
+    } else {
+        ds9_image::render_rgba_flipped(img, limits, f.stretch, f.cmap)
+    };
+    if f.orientation != Orientation::Identity {
+        ds9_image::apply_orientation_rgba(&mut rgba, img.width, img.height, f.orientation);
+    }
+    rgba
 }
 
 fn make_colorbar_strip(cmap: Colormap) -> Image {
@@ -169,8 +281,26 @@ fn fit_zoom(w: usize, h: usize) -> f32 {
 
 /// Marker storage uses DS9 / FITS conventions (1-based, y up from bottom).
 /// The slint canvas wants display-space coords (0-based, y down). Convert.
+/// (No orientation applied — see [`fits_to_display_oriented`] for the
+/// orientation-aware variant.)
 fn fits_to_display(cx: f64, cy: f64, h: usize) -> (f32, f32) {
     ((cx - 1.0) as f32, (h as f32 - cy as f32))
+}
+
+/// Like [`fits_to_display`] but also applies the frame's display orientation.
+fn fits_to_display_oriented(cx: f64, cy: f64, f: &Frame) -> (f32, f32) {
+    let (dx, dy) = fits_to_display(cx, cy, f.fits.height);
+    let (w, h) = (f.fits.width as f64, f.fits.height as f64);
+    let (ox, oy) = f.orientation.apply_display(dx as f64, dy as f64, w, h);
+    (ox as f32, oy as f32)
+}
+
+/// Inverse of [`fits_to_display_oriented`]: take a slint canvas display coord
+/// (0-based, y-down, possibly oriented) and return the underlying FITS coord.
+fn display_to_fits(dx: f64, dy: f64, f: &Frame) -> (f64, f64) {
+    let (w, h) = (f.fits.width as f64, f.fits.height as f64);
+    let (ux, uy) = f.orientation.invert_display(dx, dy, w, h);
+    (ux + 1.0, h - uy)
 }
 
 fn marker_color(m: &Marker) -> slint::Color {
@@ -178,7 +308,6 @@ fn marker_color(m: &Marker) -> slint::Color {
 }
 
 fn build_mark_model(f: &Frame) -> ModelRc<Mark> {
-    let h = f.fits.height;
     let cat_count = f.catalog.as_ref().map(|c| c.len()).unwrap_or(0).min(5000);
     let mut out: Vec<Mark> = Vec::with_capacity(f.markers.len() + cat_count);
 
@@ -187,7 +316,7 @@ fn build_mark_model(f: &Frame) -> ModelRc<Mark> {
         let amber = slint::Color::from_argb_u8(0xff, 0xff, 0xc1, 0x07);
         for (i, (x, y)) in cat.xy_iter().enumerate() {
             if i >= 5000 { break; }
-            let (cx, cy) = fits_to_display(x, y, h);
+            let (cx, cy) = fits_to_display_oriented(x, y, f);
             let selected = f.selected_catalog == Some(i);
             // make the selected source visibly bigger so it stands out at low zoom
             let r = if selected { 8.0 } else { 4.0 };
@@ -203,29 +332,133 @@ fn build_mark_model(f: &Frame) -> ModelRc<Mark> {
         let sel = f.selected_marker == Some(i);
         let mark = match &m.shape {
             MShape::Circle { center: c, r } => {
-                let (cx, cy) = fits_to_display(c.x, c.y, h);
+                let (cx, cy) = fits_to_display_oriented(c.x, c.y, f);
                 Some(Mark { kind: 0, cx, cy, rx: *r as f32, ry: *r as f32, color, selected: sel })
             }
             MShape::Box { center: c, w, h: bh, .. } => {
-                let (cx, cy) = fits_to_display(c.x, c.y, h);
+                let (cx, cy) = fits_to_display_oriented(c.x, c.y, f);
                 Some(Mark { kind: 1, cx, cy, rx: (*w as f32) / 2.0, ry: (*bh as f32) / 2.0, color, selected: sel })
             }
             MShape::Ellipse { center: c, a, b, .. } => {
-                let (cx, cy) = fits_to_display(c.x, c.y, h);
+                let (cx, cy) = fits_to_display_oriented(c.x, c.y, f);
                 Some(Mark { kind: 0, cx, cy, rx: *a as f32, ry: *b as f32, color, selected: sel })
             }
             MShape::Annulus { center: c, r_outer, .. } => {
-                let (cx, cy) = fits_to_display(c.x, c.y, h);
+                let (cx, cy) = fits_to_display_oriented(c.x, c.y, f);
                 Some(Mark { kind: 0, cx, cy, rx: *r_outer as f32, ry: *r_outer as f32, color, selected: sel })
             }
             MShape::Point { center: c } => {
-                let (cx, cy) = fits_to_display(c.x, c.y, h);
+                let (cx, cy) = fits_to_display_oriented(c.x, c.y, f);
                 Some(Mark { kind: 1, cx, cy, rx: 2.0, ry: 2.0, color, selected: sel })
             }
-            // line / polygon / compass / text not yet drawn
+            // line / polygon / compass / text are baked into the line overlay
+            // (see render_line_overlay) — they don't contribute Mark rectangles.
             _ => None,
         };
         if let Some(m) = mark { out.push(m); }
+    }
+    ModelRc::new(VecModel::from(out))
+}
+
+/// Bake DS9 line / polygon / compass markers as a frame-resolution RGBA strip
+/// (same dims as the rendered image, oriented). Returns None if there's nothing
+/// to draw, in which case callers should hide the overlay.
+fn render_line_overlay(f: &Frame) -> Option<Image> {
+    let (w, h) = (f.fits.width, f.fits.height);
+    if w == 0 || h == 0 { return None; }
+
+    let mut buf = SharedPixelBuffer::<Rgba8Pixel>::new(w as u32, h as u32);
+    let bytes = buf.make_mut_bytes();
+    for px in bytes.chunks_exact_mut(4) { px.copy_from_slice(&[0, 0, 0, 0]); }
+
+    let mut any = false;
+    let put = |bytes: &mut [u8], x: i32, y: i32, c: [u8; 4]| {
+        if x < 0 || y < 0 { return; }
+        let (xu, yu) = (x as usize, y as usize);
+        if xu >= w || yu >= h { return; }
+        let i = (yu * w + xu) * 4;
+        bytes[i..i+4].copy_from_slice(&c);
+    };
+    let draw_line = |bytes: &mut [u8], x0: i32, y0: i32, x1: i32, y1: i32, c: [u8; 4]| {
+        let dx =  (x1 - x0).abs();
+        let dy = -(y1 - y0).abs();
+        let sx = if x0 < x1 { 1 } else { -1 };
+        let sy = if y0 < y1 { 1 } else { -1 };
+        let mut err = dx + dy;
+        let (mut x, mut y) = (x0, y0);
+        let max_steps = (w + h) as i32 * 4;
+        let mut steps = 0;
+        loop {
+            put(bytes, x, y, c);
+            if x == x1 && y == y1 { break; }
+            let e2 = 2 * err;
+            if e2 >= dy { err += dy; x += sx; }
+            if e2 <= dx { err += dx; y += sy; }
+            steps += 1;
+            if steps > max_steps { break; }
+        }
+    };
+    let to_xy = |fx: f64, fy: f64| -> (i32, i32) {
+        let (dx, dy) = fits_to_display_oriented(fx, fy, f);
+        (dx.round() as i32, dy.round() as i32)
+    };
+
+    for m in &f.markers {
+        let c = m.color;
+        match &m.shape {
+            MShape::Line { from, to } => {
+                let (x0, y0) = to_xy(from.x, from.y);
+                let (x1, y1) = to_xy(to.x,   to.y);
+                draw_line(bytes, x0, y0, x1, y1, c);
+                // arrowhead — short bevel back from the endpoint
+                let dx = (x1 - x0) as f64;
+                let dy = (y1 - y0) as f64;
+                let len = (dx*dx + dy*dy).sqrt().max(1.0);
+                let (ux, uy) = (dx / len, dy / len);
+                let head = 9.0_f64;
+                for off in [(-uy, ux), (uy, -ux)] {
+                    let bx = x1 as f64 - ux * head + off.0 * head * 0.4;
+                    let by = y1 as f64 - uy * head + off.1 * head * 0.4;
+                    draw_line(bytes, x1, y1, bx.round() as i32, by.round() as i32, c);
+                }
+                any = true;
+            }
+            MShape::Polygon { points } if points.len() >= 2 => {
+                for win in points.windows(2) {
+                    let (x0, y0) = to_xy(win[0].x, win[0].y);
+                    let (x1, y1) = to_xy(win[1].x, win[1].y);
+                    draw_line(bytes, x0, y0, x1, y1, c);
+                }
+                let (x0, y0) = to_xy(points[points.len()-1].x, points[points.len()-1].y);
+                let (x1, y1) = to_xy(points[0].x, points[0].y);
+                draw_line(bytes, x0, y0, x1, y1, c);
+                any = true;
+            }
+            MShape::Compass { center, len } => {
+                let (cx, cy) = to_xy(center.x, center.y);
+                let l = *len as i32;
+                draw_line(bytes, cx, cy, cx + l, cy, c); // east
+                draw_line(bytes, cx, cy, cx, cy - l, c); // north (display y-up)
+                any = true;
+            }
+            _ => {}
+        }
+    }
+
+    if any { Some(Image::from_rgba8(buf)) } else { None }
+}
+
+fn build_text_marks(f: &Frame) -> ModelRc<TextMark> {
+    let mut out: Vec<TextMark> = Vec::new();
+    for m in &f.markers {
+        if let MShape::Text { center, body } = &m.shape {
+            let (dx, dy) = fits_to_display_oriented(center.x, center.y, f);
+            out.push(TextMark {
+                x: dx, y: dy,
+                body: body.clone().into(),
+                color: marker_color(m),
+            });
+        }
     }
     ModelRc::new(VecModel::from(out))
 }
@@ -366,12 +599,35 @@ fn refresh_view(window: &MainWindow, st: &State) {
     window.set_active_cmap(f.cmap.name().into());
     window.set_colorbar_strip(make_colorbar_strip(f.cmap));
     window.set_markers(build_mark_model(f));
+    window.set_text_marks(build_text_marks(f));
     window.set_catalog_rows(build_catalog_model(f));
     window.set_catalog_selected(f.selected_catalog.map(|i| i as i32).unwrap_or(-1));
     window.set_fits_image(render_image(f));
     window.set_fits_width(f.fits.width as i32);
     window.set_fits_height(f.fits.height as i32);
     window.set_info_filename(f.name.clone().into());
+
+    // refresh line / vector / polygon / compass overlay
+    match render_line_overlay(f) {
+        Some(img) => { window.set_line_image(img); window.set_line_visible(true); }
+        None => window.set_line_visible(false),
+    }
+
+    // refresh the WCS grid (cheap to bake at frame dims) when toggled on
+    if window.get_grid_visible() {
+        if let Some(img) = render_grid_overlay(f) {
+            window.set_grid_image(img);
+        } else {
+            window.set_grid_visible(false);
+        }
+    }
+    push_crosshair_to_window(window, st);
+
+    // sync the lock toggles so the menu's check state is accurate
+    window.set_lock_zoom(st.lock_zoom);
+    window.set_lock_pan(st.lock_pan);
+    window.set_lock_cmap(st.lock_cmap);
+    window.set_lock_scale(st.lock_scale);
 }
 
 /// 128-bin histogram of finite samples in [lo, hi], rendered as a log-scale
@@ -496,7 +752,215 @@ fn render_contour_overlay(f: &Frame) -> Image {
             }
         }
     }
+    if f.orientation != Orientation::Identity {
+        ds9_image::apply_orientation_rgba(buf.make_mut_bytes(), w, h, f.orientation);
+    }
     Image::from_rgba8(buf)
+}
+
+/// Render an RA/Dec grid as an image-resolution RGBA overlay. Picks a "nice"
+/// step on each axis so the visible field hits ~6-8 grid lines. Returns None
+/// if the frame has no WCS or world↔pixel projection fails everywhere.
+fn render_grid_overlay(f: &Frame) -> Option<Image> {
+    let wcs = f.fits.wcs.as_ref()?;
+    let w = f.fits.width;
+    let h = f.fits.height;
+    if w == 0 || h == 0 { return None; }
+
+    // Sample the four edges to bracket the visible RA/Dec range.
+    let mut ras: Vec<f64> = Vec::new();
+    let mut decs: Vec<f64> = Vec::new();
+    let n_edge = 16;
+    for i in 0..=n_edge {
+        let t = i as f64 / n_edge as f64;
+        let xs = 1.0 + t * (w as f64 - 1.0);
+        let ys = 1.0 + t * (h as f64 - 1.0);
+        for &(x, y) in &[
+            (xs, 1.0), (xs, h as f64),
+            (1.0, ys), (w as f64, ys),
+        ] {
+            let (ra, dec) = wcs.pix_to_world(x, y);
+            ras.push(ra);
+            decs.push(dec);
+        }
+    }
+
+    let dec_min = decs.iter().cloned().fold(f64::INFINITY, f64::min);
+    let dec_max = decs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    if !dec_min.is_finite() || !dec_max.is_finite() { return None; }
+
+    // RA is periodic — handle 0/360 wrap by working in (sin, cos) space and
+    // recovering a contiguous span if the points straddle 0°.
+    let mut ra_min = ras.iter().cloned().fold(f64::INFINITY, f64::min);
+    let mut ra_max = ras.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    if ra_max - ra_min > 180.0 {
+        // wrap: shift any RA < 180 by +360 so the span stays small
+        let shifted: Vec<f64> = ras.iter().map(|&r| if r < 180.0 { r + 360.0 } else { r }).collect();
+        ra_min = shifted.iter().cloned().fold(f64::INFINITY, f64::min);
+        ra_max = shifted.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    }
+
+    let nice_step = |span: f64| -> f64 {
+        // ~6-8 lines across the span. Candidates from coarse degrees down to 1".
+        const STEPS: &[f64] = &[
+            30.0, 15.0, 10.0, 5.0, 2.0, 1.0,
+            0.5, 30.0/60.0, 15.0/60.0, 10.0/60.0, 5.0/60.0, 2.0/60.0, 1.0/60.0,
+            30.0/3600.0, 15.0/3600.0, 10.0/3600.0, 5.0/3600.0, 2.0/3600.0, 1.0/3600.0,
+        ];
+        for &s in STEPS {
+            if span / s <= 8.0 && span / s >= 2.0 { return s; }
+        }
+        // very tight or very wide — pick the smallest meaningful one
+        STEPS[STEPS.len() - 1]
+    };
+    let ra_step  = nice_step(ra_max - ra_min);
+    let dec_step = nice_step(dec_max - dec_min);
+
+    let mut buf = SharedPixelBuffer::<Rgba8Pixel>::new(w as u32, h as u32);
+    let bytes = buf.make_mut_bytes();
+    for px in bytes.chunks_exact_mut(4) { px.copy_from_slice(&[0, 0, 0, 0]); }
+    let line_color = [0x4e, 0xc9, 0xb0, 0x90]; // teal, semi-transparent
+
+    let put = |bytes: &mut [u8], x: i32, y: i32, c: [u8; 4]| {
+        if x >= 0 && (x as usize) < w && y >= 0 && (y as usize) < h {
+            let i = (y as usize * w + x as usize) * 4;
+            bytes[i..i+4].copy_from_slice(&c);
+        }
+    };
+
+    // Bresenham — clipped at the put-bounds.
+    let draw_line = |bytes: &mut [u8], x0: i32, y0: i32, x1: i32, y1: i32, c: [u8; 4]| {
+        let dx =  (x1 - x0).abs();
+        let dy = -(y1 - y0).abs();
+        let sx = if x0 < x1 { 1 } else { -1 };
+        let sy = if y0 < y1 { 1 } else { -1 };
+        let mut err = dx + dy;
+        let (mut x, mut y) = (x0, y0);
+        // sanity cap so a runaway projection can't lock us up
+        let mut steps = 0;
+        let max_steps = (w + h) as i32 * 4;
+        loop {
+            put(bytes, x, y, c);
+            if x == x1 && y == y1 { break; }
+            let e2 = 2 * err;
+            if e2 >= dy { err += dy; x += sx; }
+            if e2 <= dx { err += dx; y += sy; }
+            steps += 1;
+            if steps > max_steps { break; }
+        }
+    };
+
+    let project = |ra: f64, dec: f64| -> Option<(i32, i32)> {
+        let (px, py) = wcs.world_to_pix(ra, dec)?;
+        // FITS y → display y (top-down). Marker code uses `h - cy`, so:
+        let dx = (px - 1.0).round() as i32;
+        let dy = (h as f64 - py).round() as i32;
+        Some((dx, dy))
+    };
+
+    // Lines of constant Dec, sampled in RA.
+    let dec_first = (dec_min / dec_step).floor() * dec_step;
+    let n_dec = ((dec_max - dec_first) / dec_step).ceil() as i32 + 1;
+    for k in 0..n_dec {
+        let dec = dec_first + k as f64 * dec_step;
+        if dec < dec_min - 0.5 * dec_step || dec > dec_max + 0.5 * dec_step { continue; }
+        let mut prev: Option<(i32, i32)> = None;
+        let n_pts = 200;
+        for j in 0..=n_pts {
+            let t = j as f64 / n_pts as f64;
+            let ra = ra_min + t * (ra_max - ra_min);
+            // unwrap shifted RA back into [0, 360)
+            let ra_norm = ra.rem_euclid(360.0);
+            match project(ra_norm, dec) {
+                Some(p) => {
+                    if let Some(p0) = prev { draw_line(bytes, p0.0, p0.1, p.0, p.1, line_color); }
+                    prev = Some(p);
+                }
+                None => prev = None,
+            }
+        }
+    }
+    // Lines of constant RA, sampled in Dec.
+    let ra_first = (ra_min / ra_step).floor() * ra_step;
+    let n_ra = ((ra_max - ra_first) / ra_step).ceil() as i32 + 1;
+    for k in 0..n_ra {
+        let ra = ra_first + k as f64 * ra_step;
+        if ra < ra_min - 0.5 * ra_step || ra > ra_max + 0.5 * ra_step { continue; }
+        let ra_norm = ra.rem_euclid(360.0);
+        let mut prev: Option<(i32, i32)> = None;
+        let n_pts = 200;
+        for j in 0..=n_pts {
+            let t = j as f64 / n_pts as f64;
+            let dec = dec_min + t * (dec_max - dec_min);
+            match project(ra_norm, dec) {
+                Some(p) => {
+                    if let Some(p0) = prev { draw_line(bytes, p0.0, p0.1, p.0, p.1, line_color); }
+                    prev = Some(p);
+                }
+                None => prev = None,
+            }
+        }
+    }
+
+    if f.orientation != Orientation::Identity {
+        ds9_image::apply_orientation_rgba(buf.make_mut_bytes(), w, h, f.orientation);
+    }
+    Some(Image::from_rgba8(buf))
+}
+
+/// Compute the active frame's display-space (0-based, y-down) crosshair coords
+/// from the session crosshair, projecting through the frame's WCS when both
+/// the world point and the frame's WCS are available. Returns None if the
+/// crosshair does not project into this frame.
+fn project_crosshair(st: &State) -> Option<(f32, f32)> {
+    let ch = st.crosshair.as_ref()?;
+    let f = st.active_frame()?;
+
+    // Prefer world-space lock when both ends have a WCS.
+    if let (Some((ra, dec)), Some(wcs)) = (ch.world, f.fits.wcs.as_ref()) {
+        if let Some((px, py)) = wcs.world_to_pix(ra, dec) {
+            let (dx, dy) = fits_to_display_oriented(px, py, f);
+            return Some((dx, dy));
+        }
+    }
+    // Fall back to raw pixel coords if the crosshair was placed in *this* frame.
+    let (idx, fx, fy) = ch.pixel;
+    if idx == st.active {
+        let (dx, dy) = fits_to_display_oriented(fx, fy, f);
+        return Some((dx, dy));
+    }
+    None
+}
+
+fn push_crosshair_to_window(window: &MainWindow, st: &State) {
+    match project_crosshair(st) {
+        Some((dx, dy)) => {
+            window.set_crosshair_x(dx);
+            window.set_crosshair_y(dy);
+            window.set_crosshair_visible(true);
+        }
+        None => window.set_crosshair_visible(false),
+    }
+}
+
+/// Place the session crosshair from a *display-space* (0-based, y-down) point
+/// in the active frame. Captures world coords if the frame has a WCS so other
+/// frames with a WCS can mirror the same sky position.
+fn set_crosshair_at_display(window: &MainWindow, st: &mut State, dx: f64, dy: f64) {
+    let active = st.active;
+    let (fx_fits, fy_fits, world) = {
+        let Some(f) = st.active_frame() else { return };
+        let (fx, fy) = display_to_fits(dx, dy, f);
+        let world = f.fits.wcs.as_ref().map(|w| w.pix_to_world(fx, fy));
+        (fx, fy, world)
+    };
+    st.crosshair = Some(Crosshair { world, pixel: (active, fx_fits, fy_fits) });
+    push_crosshair_to_window(window, st);
+    let label = match world {
+        Some((ra, dec)) => format!("crosshair: ({fx_fits:.1}, {fy_fits:.1})  α={ra:.6}°  δ={dec:.6}°"),
+        None => format!("crosshair: ({fx_fits:.1}, {fy_fits:.1})  [no WCS]"),
+    };
+    window.set_status_text(label.into());
 }
 
 /// min / max / mean / median / std over finite samples.
@@ -963,6 +1427,156 @@ fn write_basic_fits(path: &Path, img: &FitsImage) -> std::io::Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------- locks --
+
+/// Apply each currently-on frame-lock from the active frame to every other
+/// frame. Called when a Lock toggle flips on, and after any menu-driven change
+/// that should propagate (cmap, scale, …). Continuous pan/zoom is handled
+/// separately via the slint view-changed callback.
+fn broadcast_locks(st: &mut State) {
+    let Some(active) = st.active_frame() else { return };
+    let zoom  = active.view_zoom;
+    let pan_x = active.view_pan_x;
+    let pan_y = active.view_pan_y;
+    let cmap  = active.cmap;
+    let stretch = active.stretch;
+    let limits  = active.limits_mode;
+    let active_idx = st.active;
+    let (lz, lp, lc, ls) = (st.lock_zoom, st.lock_pan, st.lock_cmap, st.lock_scale);
+    for (i, fr) in st.frames.iter_mut().enumerate() {
+        if i == active_idx { continue; }
+        if lz { fr.view_zoom  = zoom; }
+        if lp { fr.view_pan_x = pan_x; fr.view_pan_y = pan_y; }
+        if lc { fr.cmap = cmap; fr.custom_lut = None; }
+        if ls { fr.stretch = stretch; fr.limits_mode = limits; }
+    }
+}
+
+/// Push the active frame's colormap to every other frame (used when
+/// `lock_cmap` is on and the user picks a new color).
+fn broadcast_cmap(st: &mut State) {
+    let Some(active) = st.active_frame() else { return };
+    let cmap = active.cmap;
+    let active_idx = st.active;
+    for (i, fr) in st.frames.iter_mut().enumerate() {
+        if i == active_idx { continue; }
+        fr.cmap = cmap;
+        fr.custom_lut = None;
+    }
+}
+
+// ---------------------------------------------------------------- export --
+
+/// Write a minimal uncompressed RGB TIFF (8-bit, top-down). No compression,
+/// no extra tags beyond the bare minimum the spec requires for a viewer to
+/// open the file.
+fn write_tiff_rgb(path: &Path, rgba: &[u8], w: u32, h: u32) -> std::io::Result<()> {
+    use std::io::Write;
+    // Convert RGBA → RGB
+    let mut rgb: Vec<u8> = Vec::with_capacity((w * h * 3) as usize);
+    for px in rgba.chunks_exact(4) {
+        rgb.extend_from_slice(&px[..3]);
+    }
+    // Header: little-endian "II", magic 42, IFD offset 8.
+    let mut bytes: Vec<u8> = Vec::new();
+    bytes.extend_from_slice(b"II");
+    bytes.extend_from_slice(&42u16.to_le_bytes());
+    bytes.extend_from_slice(&8u32.to_le_bytes());
+    // IFD: 12 entries × 12 bytes = 144 bytes; header is 8; IFD starts at 8;
+    // strip data starts after IFD + next-offset (4 bytes) + extras.
+    // We need offsets for: BitsPerSample (3 SHORTs => 6 bytes value), and
+    // StripOffsets when only one strip → fits in 4-byte field.
+    let bps_offset: u32   = 8 + 2 + (12 * 12) + 4;  // after IFD + nextIFD
+    let strip_offset: u32 = bps_offset + 6;
+    let strip_bytes: u32  = (w * h * 3) as u32;
+
+    let entries: [(u16, u16, u32, u32); 12] = [
+        // tag, type, count, value/offset
+        (0x00FE, 4, 1, 0),                 // NewSubfileType: 0
+        (0x0100, 4, 1, w),                 // ImageWidth
+        (0x0101, 4, 1, h),                 // ImageLength
+        (0x0102, 3, 3, bps_offset),        // BitsPerSample (8,8,8)
+        (0x0103, 3, 1, 1),                 // Compression: none
+        (0x0106, 3, 1, 2),                 // PhotometricInterpretation: RGB
+        (0x0111, 4, 1, strip_offset),      // StripOffsets
+        (0x0115, 3, 1, 3),                 // SamplesPerPixel
+        (0x0116, 4, 1, h),                 // RowsPerStrip
+        (0x0117, 4, 1, strip_bytes),       // StripByteCounts
+        (0x011C, 3, 1, 1),                 // PlanarConfiguration: chunky
+        (0x0153, 3, 3, bps_offset),        // SampleFormat (1,1,1) — re-uses BPS slot
+    ];
+
+    bytes.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+    for (tag, typ, count, val) in entries {
+        bytes.extend_from_slice(&tag.to_le_bytes());
+        bytes.extend_from_slice(&typ.to_le_bytes());
+        bytes.extend_from_slice(&count.to_le_bytes());
+        // For SHORT count 3 we wrote an offset (bps_offset); for SHORT count 1
+        // the value goes in the low 2 bytes — but since we wrote a u32 directly
+        // it works out either way (LE).
+        bytes.extend_from_slice(&val.to_le_bytes());
+    }
+    bytes.extend_from_slice(&0u32.to_le_bytes());     // next-IFD = 0
+
+    // BitsPerSample / SampleFormat shared slot: 3 SHORTs = 6 bytes
+    bytes.extend_from_slice(&8u16.to_le_bytes());
+    bytes.extend_from_slice(&8u16.to_le_bytes());
+    bytes.extend_from_slice(&8u16.to_le_bytes());
+
+    // Pixel data
+    bytes.extend_from_slice(&rgb);
+
+    let mut f = std::fs::File::create(path)?;
+    f.write_all(&bytes)
+}
+
+/// Write the rendered image as an EPSF — minimal PostScript that wraps an
+/// 8-bit RGB image stream. No fonts / titles / margins; the viewer figures
+/// out scaling from the bounding box.
+fn write_postscript_rgb(path: &Path, rgba: &[u8], w: u32, h: u32) -> std::io::Result<()> {
+    use std::fmt::Write as _;
+    use std::io::Write;
+    // Page is letter, 72 dpi. Fit the image into a 540×720 box centred.
+    let target_w = 540.0_f64.min(w as f64 * 2.0);
+    let scale = target_w / w as f64;
+    let target_h = h as f64 * scale;
+    let xl = (612.0 - target_w) / 2.0;
+    let yl = (792.0 - target_h) / 2.0;
+
+    let mut s = String::new();
+    let _ = writeln!(s, "%!PS-Adobe-3.0 EPSF-3.0");
+    let _ = writeln!(s, "%%BoundingBox: {xl:.0} {yl:.0} {xr:.0} {yr:.0}",
+        xr = xl + target_w, yr = yl + target_h);
+    let _ = writeln!(s, "%%Pages: 1");
+    let _ = writeln!(s, "%%EndComments");
+    let _ = writeln!(s, "/picstr {} string def", w * 3);
+    let _ = writeln!(s, "{xl} {yl} translate");
+    let _ = writeln!(s, "{target_w:.2} {target_h:.2} scale");
+    let _ = writeln!(s, "{w} {h} 8");
+    // Image matrix: flip Y so row 0 is on top.
+    let _ = writeln!(s, "[ {w} 0 0 -{h} 0 {h} ]");
+    let _ = writeln!(s, "{{ currentfile picstr readhexstring pop }}");
+    let _ = writeln!(s, "false 3 colorimage");
+    let mut f = std::fs::File::create(path)?;
+    f.write_all(s.as_bytes())?;
+    // hex stream — 60 chars per line keeps the PS readable
+    let mut col = 0;
+    for px in rgba.chunks_exact(4) {
+        for &b in &px[..3] {
+            f.write_all(&[hex_nib(b >> 4), hex_nib(b & 0x0f)])?;
+            col += 2;
+            if col >= 60 { f.write_all(b"\n")?; col = 0; }
+        }
+    }
+    if col != 0 { f.write_all(b"\n")?; }
+    f.write_all(b"\n%%EOF\n")?;
+    Ok(())
+}
+
+fn hex_nib(n: u8) -> u8 {
+    if n < 10 { b'0' + n } else { b'a' + (n - 10) }
+}
+
 // ---------------------------------------------------------------- menus --
 
 fn handle_menu(window: &MainWindow, st: &mut State, menu: &str, item: &str) {
@@ -971,6 +1585,109 @@ fn handle_menu(window: &MainWindow, st: &mut State, menu: &str, item: &str) {
         ("File", "Open…") => window.invoke_request_open_file(),
         ("File", "Save Image…") => save_image_png(window, st),
         ("File", "Save FITS…")  => save_image_fits(window, st),
+        ("File", "Save TIFF…") => {
+            let Some(f) = st.active_frame() else {
+                window.set_status_text("save tiff: no active frame".into()); return;
+            };
+            let chosen: Option<PathBuf> = rfd::FileDialog::new()
+                .set_title("Save image as TIFF")
+                .set_file_name(format!("{}.tif",
+                    f.name.trim_end_matches(".fits").trim_end_matches(".fit")))
+                .add_filter("TIFF", &["tif", "tiff"])
+                .save_file();
+            let Some(p) = chosen else { return };
+            let rgba = render_rgba_for_frame(f);
+            match write_tiff_rgb(&p, &rgba, f.fits.width as u32, f.fits.height as u32) {
+                Ok(()) => window.set_status_text(format!("wrote {}", p.display()).into()),
+                Err(e) => window.set_status_text(format!("save tiff: {e}").into()),
+            }
+        }
+        ("File", "Save JPEG…") => {
+            window.set_status_text(
+                "JPEG export not built in — use 'Save Image…' (PNG) or 'Save TIFF…' for now".into()
+            );
+        }
+        ("File", "Save PostScript…") => {
+            let Some(f) = st.active_frame() else {
+                window.set_status_text("save ps: no active frame".into()); return;
+            };
+            let chosen: Option<PathBuf> = rfd::FileDialog::new()
+                .set_title("Save image as PostScript")
+                .set_file_name(format!("{}.eps",
+                    f.name.trim_end_matches(".fits").trim_end_matches(".fit")))
+                .add_filter("PostScript", &["ps", "eps"])
+                .save_file();
+            let Some(p) = chosen else { return };
+            let rgba = render_rgba_for_frame(f);
+            match write_postscript_rgb(&p, &rgba, f.fits.width as u32, f.fits.height as u32) {
+                Ok(()) => window.set_status_text(format!("wrote {}", p.display()).into()),
+                Err(e) => window.set_status_text(format!("save ps: {e}").into()),
+            }
+        }
+        ("File", "HDU Navigator…") => {
+            let Some(active) = st.active_frame() else {
+                window.set_status_text("HDU navigator: no active frame".into()); return;
+            };
+            let Some(path) = active.source_path.clone() else {
+                window.set_status_text(
+                    "HDU navigator: active frame is synthetic (no source file)".into()
+                );
+                return;
+            };
+            let cur_idx = active.hdu_idx;
+            match ds9_fits::enumerate_hdus(&path) {
+                Ok(hdus) if !hdus.is_empty() => {
+                    // pick the next loadable HDU (an image / tile-compressed) after the current one,
+                    // wrapping around. If none are loadable, just bail with an info message.
+                    let total = hdus.len();
+                    let mut chosen: Option<usize> = None;
+                    for k in 1..=total {
+                        let try_idx = (cur_idx + k) % total;
+                        let kind = hdus[try_idx].kind;
+                        if kind == "PRIMARY" || kind == "IMAGE" || kind == "TILE-COMPRESSED" {
+                            chosen = Some(try_idx);
+                            break;
+                        }
+                    }
+                    let Some(target) = chosen else {
+                        let listing = hdus.iter().map(|h|
+                            format!("  [{}] {} {}", h.idx, h.kind, h.name)
+                        ).collect::<Vec<_>>().join(" │ ");
+                        window.set_status_text(
+                            format!("HDU navigator: no image HDUs in {} ({total} total): {listing}", path.display()).into()
+                        );
+                        return;
+                    };
+                    match ds9_fits::load_hdu(&path, target) {
+                        Ok(img) => {
+                            let (w, h) = (img.width, img.height);
+                            let info = &hdus[target];
+                            save_view_into_active(window, st);
+                            if let Some(f) = st.active_frame_mut() {
+                                let new_name = format!("{}[{}]",
+                                    path.file_name().and_then(|s| s.to_str()).unwrap_or("(fits)"),
+                                    info.name);
+                                f.fits = img;
+                                f.name = new_name;
+                                f.hdu_idx = target;
+                                f.view_zoom = fit_zoom(w, h);
+                                f.view_pan_x = 0.0;
+                                f.view_pan_y = 0.0;
+                            }
+                            push_view_to_window(window, st);
+                            refresh_view(window, st);
+                            window.set_status_text(format!(
+                                "HDU [{target}] {} {} ({w}×{h})",
+                                info.kind, info.name,
+                            ).into());
+                        }
+                        Err(e) => window.set_status_text(format!("HDU load: {e}").into()),
+                    }
+                }
+                Ok(_) => window.set_status_text("HDU navigator: file has no HDUs".into()),
+                Err(e) => window.set_status_text(format!("HDU navigator: {e}").into()),
+            }
+        }
         ("File", "Print…") => {
             // Spawn a print pipeline by saving a PNG to a temp path and
             // shelling out to `lpr`. If lpr isn't on PATH, fall back to
@@ -1003,6 +1720,53 @@ fn handle_menu(window: &MainWindow, st: &mut State, menu: &str, item: &str) {
             }
         }
         ("File", "Quit")  => { let _ = slint::quit_event_loop(); }
+
+        // View — sidebar panel toggles and overlays
+        ("View", "Panner") => {
+            let on = !window.get_panner_visible();
+            window.set_panner_visible(on);
+            window.set_status_text(if on { "panner: shown".into() } else { "panner: hidden".into() });
+        }
+        ("View", "Magnifier") => {
+            let on = !window.get_magnifier_visible();
+            window.set_magnifier_visible(on);
+            window.set_status_text(if on { "magnifier: shown".into() } else { "magnifier: hidden".into() });
+        }
+        ("View", "Coordinate Grid") => {
+            let Some(f) = st.active_frame() else {
+                window.set_status_text("grid: no active frame".into()); return;
+            };
+            if f.fits.wcs.is_none() {
+                window.set_status_text("grid: active frame has no WCS".into()); return;
+            }
+            let on = !window.get_grid_visible();
+            if on {
+                match render_grid_overlay(f) {
+                    Some(img) => {
+                        window.set_grid_image(img);
+                        window.set_grid_visible(true);
+                        window.set_status_text("grid: shown".into());
+                    }
+                    None => window.set_status_text("grid: WCS projection failed".into()),
+                }
+            } else {
+                window.set_grid_visible(false);
+                window.set_status_text("grid: hidden".into());
+            }
+        }
+        ("View", "Crosshair") => {
+            // toggle: if a crosshair exists, clear it; otherwise drop one at
+            // the cursor's current position.
+            if st.crosshair.is_some() {
+                st.crosshair = None;
+                push_crosshair_to_window(window, st);
+                window.set_status_text("crosshair: cleared".into());
+            } else {
+                let cx = window.get_cursor_image_x() as f64;
+                let cy = window.get_cursor_image_y() as f64;
+                set_crosshair_at_display(window, st, cx, cy);
+            }
+        }
 
         // Frame
         ("Frame", "New Frame") => window.invoke_request_open_file(),
@@ -1061,6 +1825,42 @@ fn handle_menu(window: &MainWindow, st: &mut State, menu: &str, item: &str) {
                 else    { "blink: off".into() }
             );
         }
+        ("Frame", "Rotate 180°") | ("Frame", "Flip Horizontal") | ("Frame", "Flip Vertical")
+        | ("Frame", "Reset Orientation") => {
+            let new_o = match item {
+                "Rotate 180°"       => Orientation::Rot180,
+                "Flip Horizontal"   => Orientation::FlipH,
+                "Flip Vertical"     => Orientation::FlipV,
+                _                   => Orientation::Identity,
+            };
+            if let Some(f) = st.active_frame_mut() {
+                f.orientation = new_o;
+            }
+            refresh_view(window, st);
+            window.set_status_text(format!("orientation: {}", new_o.name()).into());
+        }
+        ("Frame", "Lock Zoom") | ("Frame", "Lock Pan")
+        | ("Frame", "Lock Color") | ("Frame", "Lock Scale") => {
+            let (slot, label) = match item {
+                "Lock Zoom"  => (&mut st.lock_zoom, "lock zoom"),
+                "Lock Pan"   => (&mut st.lock_pan,  "lock pan"),
+                "Lock Color" => (&mut st.lock_cmap, "lock color"),
+                "Lock Scale" => (&mut st.lock_scale, "lock scale"),
+                _ => return,
+            };
+            *slot = !*slot;
+            let on = *slot;
+            window.set_status_text(format!("{label}: {}", if on { "on" } else { "off" }).into());
+            // sync the slint mirror
+            if item == "Lock Zoom"  { window.set_lock_zoom(on);  }
+            if item == "Lock Pan"   { window.set_lock_pan(on);   }
+            if item == "Lock Color" { window.set_lock_cmap(on);  }
+            if item == "Lock Scale" { window.set_lock_scale(on); }
+            // when turning on, apply the active frame's state to every other frame
+            if on {
+                broadcast_locks(st);
+            }
+        }
         ("Frame", "RGB Composite") => {
             if st.frames.len() < 3 {
                 window.set_status_text("RGB: need at least 3 frames loaded".into());
@@ -1092,6 +1892,16 @@ fn handle_menu(window: &MainWindow, st: &mut State, menu: &str, item: &str) {
         ("Scale", "zscale")  => { if let Some(f) = st.active_frame_mut() { f.limits_mode = LimitsMode::Zscale; } refresh_view(window, st); }
 
         // Bin
+        ("Bin", "Average") | ("Bin", "Sum") | ("Bin", "Sub-sample") => {
+            let mode = match item {
+                "Average"   => BinMode::Average,
+                "Sum"       => BinMode::Sum,
+                _           => BinMode::Subsample,
+            };
+            if let Some(f) = st.active_frame_mut() { f.bin_mode = mode; }
+            refresh_view(window, st);
+            window.set_status_text(format!("bin mode: {}", mode.label()).into());
+        }
         ("Bin", n) => {
             if let Ok(factor) = n.parse::<u32>() {
                 if let Some(f) = st.active_frame_mut() { f.bin_factor = factor.max(1); }
@@ -1101,9 +1911,33 @@ fn handle_menu(window: &MainWindow, st: &mut State, menu: &str, item: &str) {
         }
 
         // Color
+        ("Color", "Load Custom…") => {
+            let chosen: Option<PathBuf> = rfd::FileDialog::new()
+                .set_title("Load custom colormap (256-stop RGB text)")
+                .add_filter("Colormap", &["lut", "cmap", "txt"])
+                .add_filter("All", &["*"])
+                .pick_file();
+            let Some(p) = chosen else { return };
+            match ds9_image::load_user_lut(&p) {
+                Ok(lut) => {
+                    if let Some(f) = st.active_frame_mut() {
+                        f.custom_lut = Some(Box::new(lut));
+                    }
+                    refresh_view(window, st);
+                    window.set_status_text(format!("custom colormap loaded from {}", p.display()).into());
+                }
+                Err(e) => window.set_status_text(format!("custom cmap: {e}").into()),
+            }
+        }
+        ("Color", "Clear Custom") => {
+            if let Some(f) = st.active_frame_mut() { f.custom_lut = None; }
+            refresh_view(window, st);
+            window.set_status_text("custom colormap cleared".into());
+        }
         ("Color", name) => {
             if let Some(c) = Colormap::from_name(name) {
-                if let Some(f) = st.active_frame_mut() { f.cmap = c; }
+                if let Some(f) = st.active_frame_mut() { f.cmap = c; f.custom_lut = None; }
+                if st.lock_cmap { broadcast_cmap(st); }
                 refresh_view(window, st);
             }
         }
@@ -1169,26 +2003,62 @@ fn handle_menu(window: &MainWindow, st: &mut State, menu: &str, item: &str) {
 
         // Analysis — smoothing
         ("Analysis", "Smooth (cycle)") => {
+            // Cycle the active kernel's strength: Gaussian σ ∈ {2,4,8,off};
+            // Boxcar / Median window n ∈ {3,5,9,off}.
             if let Some(f) = st.active_frame_mut() {
-                // 0 → 2 → 4 → 8 → 0
-                f.smooth_sigma = match f.smooth_sigma {
-                    s if s <= 0.0 => 2.0,
-                    s if s < 3.0  => 4.0,
-                    s if s < 6.0  => 8.0,
-                    _             => 0.0,
+                f.smooth_kind = match f.smooth_kind {
+                    SmoothKind::Gaussian { sigma } => {
+                        let next = match sigma {
+                            s if s <= 0.0 => 2.0,
+                            s if s < 3.0  => 4.0,
+                            s if s < 6.0  => 8.0,
+                            _             => 0.0,
+                        };
+                        SmoothKind::Gaussian { sigma: next }
+                    }
+                    SmoothKind::Boxcar { n } => {
+                        let next = match n { 0 | 1 => 3, 2..=3 => 5, 4..=5 => 9, _ => 1 };
+                        SmoothKind::Boxcar { n: next }
+                    }
+                    SmoothKind::Median { n } => {
+                        let next = match n { 0 | 1 => 3, 2..=3 => 5, 4..=5 => 9, _ => 1 };
+                        SmoothKind::Median { n: next }
+                    }
                 };
-                let label = if f.smooth_sigma <= 0.0 {
-                    "off".to_string()
-                } else {
-                    format!("σ = {:.0}px", f.smooth_sigma)
-                };
-                window.set_status_text(format!("smooth: {label}").into());
+                // mirror to the legacy sigma field so the IPC `smooth ?` query stays accurate
+                if let SmoothKind::Gaussian { sigma } = f.smooth_kind { f.smooth_sigma = sigma; }
+                window.set_status_text(format!("smooth: {}", f.smooth_kind.label()).into());
                 refresh_view(window, st);
             }
         }
         ("Analysis", "Smooth Off") => {
-            if let Some(f) = st.active_frame_mut() { f.smooth_sigma = 0.0; }
+            if let Some(f) = st.active_frame_mut() {
+                f.smooth_sigma = 0.0;
+                f.smooth_kind = SmoothKind::Gaussian { sigma: 0.0 };
+            }
             window.set_status_text("smooth: off".into());
+            refresh_view(window, st);
+        }
+        ("Analysis", "Smooth Gaussian") => {
+            if let Some(f) = st.active_frame_mut() {
+                f.smooth_kind = SmoothKind::Gaussian { sigma: 2.0 };
+                f.smooth_sigma = 2.0;
+            }
+            window.set_status_text("smooth: gaussian σ=2".into());
+            refresh_view(window, st);
+        }
+        ("Analysis", "Smooth Boxcar") => {
+            if let Some(f) = st.active_frame_mut() {
+                f.smooth_kind = SmoothKind::Boxcar { n: 3 };
+            }
+            window.set_status_text("smooth: boxcar 3×3".into());
+            refresh_view(window, st);
+        }
+        ("Analysis", "Smooth Median") => {
+            if let Some(f) = st.active_frame_mut() {
+                f.smooth_kind = SmoothKind::Median { n: 3 };
+            }
+            window.set_status_text("smooth: median 3×3".into());
             refresh_view(window, st);
         }
 
@@ -1512,15 +2382,14 @@ fn main() -> Result<()> {
         let state = Rc::clone(&state);
         win.on_canvas_mouse_move(move |x, y| {
             let Some(w) = weak.upgrade() else { return };
-            let h = w.get_fits_height();
-            let fy = if h > 0 { h as f32 - y } else { y };
-            let fits_x = (x + 1.0) as f64;
-            let fits_y = (fy + 1.0) as f64;
 
             // ----- marker drag (edit mode only) -----
             {
                 let mut s = state.borrow_mut();
-                if let (Some(idx), Some((px, py))) = (s.dragging_marker, s.last_drag_fits) {
+                let active_fits = s.active_frame().map(|f| display_to_fits(x as f64, y as f64, f));
+                if let (Some((fits_x, fits_y)), Some(idx), Some((px, py))) =
+                    (active_fits, s.dragging_marker, s.last_drag_fits)
+                {
                     if let Some(f) = s.active_frame_mut() {
                         if idx < f.markers.len() {
                             let dx = fits_x - px;
@@ -1530,7 +2399,6 @@ fn main() -> Result<()> {
                             w.set_status_text(format!(
                                 "drag region #{}  Δ=({:+.1}, {:+.1})", idx + 1, dx, dy,
                             ).into());
-                            // re-emit just the marker model to avoid re-rendering the image
                             if let Some(f) = s.active_frame() {
                                 w.set_markers(build_mark_model(f));
                             }
@@ -1540,30 +2408,27 @@ fn main() -> Result<()> {
                 }
             }
 
+            let st = state.borrow();
+            let Some(f) = st.active_frame() else {
+                w.set_info_coords("x: ——      y: ——".into());
+                w.set_info_value("value: ——".into());
+                w.set_info_wcs("wcs: ——".into());
+                return;
+            };
+            let (fits_x, fits_y) = display_to_fits(x as f64, y as f64, f);
             w.set_info_coords(format!("x: {:>7.1}    y: {:>7.1}", fits_x, fits_y).into());
 
-            // pixel value + WCS lookup
-            let ux = x as i32;
-            let uy = (fy - 1.0) as i32;
-            let st = state.borrow();
-            let (v_text, wcs_text) = if let Some(f) = st.active_frame() {
-                let img = &f.fits;
-                let v = if ux >= 0 && uy >= 0 && (ux as usize) < img.width && (uy as usize) < img.height {
-                    let v = img.data[uy as usize * img.width + ux as usize];
-                    format!("value: {v:>10.4}")
-                } else {
-                    "value: ——".to_string()
-                };
-                let w_text = if let Some(wcs) = &img.wcs {
-                    let (ra, dec) = wcs.pix_to_world(fits_x, fits_y);
-                    format!("{} {}", wcs.radesys.to_lowercase(), ds9_fits::format_sexagesimal(ra, dec))
-                } else {
-                    "wcs: ——".to_string()
-                };
-                (v, w_text)
-            } else {
-                ("value: ——".to_string(), "wcs: ——".to_string())
-            };
+            let ux = (fits_x - 1.0).round() as i32;
+            let uy = (fits_y - 1.0).round() as i32;
+            let img = &f.fits;
+            let v_text = if ux >= 0 && uy >= 0 && (ux as usize) < img.width && (uy as usize) < img.height {
+                let v = img.data[uy as usize * img.width + ux as usize];
+                format!("value: {v:>10.4}")
+            } else { "value: ——".to_string() };
+            let wcs_text = if let Some(wcs) = &img.wcs {
+                let (ra, dec) = wcs.pix_to_world(fits_x, fits_y);
+                format!("{} {}", wcs.radesys.to_lowercase(), ds9_fits::format_sexagesimal(ra, dec))
+            } else { "wcs: ——".to_string() };
             w.set_info_value(v_text.into());
             w.set_info_wcs(wcs_text.into());
         });
@@ -1576,12 +2441,25 @@ fn main() -> Result<()> {
         win.on_canvas_clicked(move |x, y| {
             let Some(w) = weak.upgrade() else { return };
             let mode = w.get_active_mode().to_string();
-            let h = w.get_fits_height();
-            // In edit mode, a click drops a small circle at the click location.
-            // Coords from slint are display-space (0-based, y-down); markers store FITS coords.
-            if mode == "edit" && h > 0 {
-                let cx_fits = (x + 1.0) as f64;
-                let cy_fits = (h as f32 - y) as f64;
+            // Crosshair mode: drop / move the session crosshair at the click.
+            if mode == "crosshair" {
+                let mut s = state.borrow_mut();
+                if s.active_frame().is_some() {
+                    set_crosshair_at_display(&w, &mut s, x as f64, y as f64);
+                    return;
+                }
+            }
+            // FITS coords from the click — orientation-aware
+            let fits_xy = {
+                let s = state.borrow();
+                s.active_frame().map(|f| display_to_fits(x as f64, y as f64, f))
+            };
+            let Some((cx_fits, cy_fits)) = fits_xy else {
+                w.set_status_text(format!("click @ image ({:.1}, {:.1})", x, y).into());
+                return;
+            };
+            // Edit mode: drop a small circle at the click
+            if mode == "edit" {
                 let r = 6.0;
                 let mut s = state.borrow_mut();
                 if let Some(f) = s.active_frame_mut() {
@@ -1591,25 +2469,20 @@ fn main() -> Result<()> {
                     return;
                 }
             }
-            // In any other mode, try to select a nearby catalog source — the
-            // OGFinder workflow: click a star on the image, the table jumps to
-            // the matching row.
-            if h > 0 {
-                let cx_fits = (x + 1.0) as f64;
-                let cy_fits = (h as f32 - y) as f64;
-                let mut s = state.borrow_mut();
-                let hit = s.active_frame()
-                    .and_then(|f| f.catalog.as_ref())
-                    .and_then(|cat| nearest_catalog_index(cat, cx_fits, cy_fits, 8.0));
-                if let Some(idx) = hit {
-                    if let Some(f) = s.active_frame_mut() { f.selected_catalog = Some(idx); }
-                    w.set_status_text(format!(
-                        "selected catalog row {} @ ({:.1}, {:.1})",
-                        idx + 1, cx_fits, cy_fits
-                    ).into());
-                    refresh_view(&w, &s);
-                    return;
-                }
+            // Otherwise, try to select a nearby catalog source — the OGFinder
+            // workflow: click a star on the image, the table jumps to the row.
+            let mut s = state.borrow_mut();
+            let hit = s.active_frame()
+                .and_then(|f| f.catalog.as_ref())
+                .and_then(|cat| nearest_catalog_index(cat, cx_fits, cy_fits, 8.0));
+            if let Some(idx) = hit {
+                if let Some(f) = s.active_frame_mut() { f.selected_catalog = Some(idx); }
+                w.set_status_text(format!(
+                    "selected catalog row {} @ ({:.1}, {:.1})",
+                    idx + 1, cx_fits, cy_fits
+                ).into());
+                refresh_view(&w, &s);
+                return;
             }
             w.set_status_text(format!("click @ image ({:.1}, {:.1})", x, y).into());
         });
@@ -1631,10 +2504,10 @@ fn main() -> Result<()> {
             if let Some((x, y)) = xy {
                 if let Some(f) = s.active_frame_mut() { f.selected_catalog = Some(idx); }
                 refresh_view(&w, &s);
-                let h = w.get_fits_height();
-                let display_x = (x - 1.0) as f32;
-                let display_y = h as f32 - y as f32;
-                w.invoke_recenter_view_on(display_x, display_y);
+                if let Some(f) = s.active_frame() {
+                    let (display_x, display_y) = fits_to_display_oriented(x, y, f);
+                    w.invoke_recenter_view_on(display_x, display_y);
+                }
                 w.set_status_text(
                     format!("row {} @ ({:.1}, {:.1})", idx + 1, x, y).into(),
                 );
@@ -1648,12 +2521,15 @@ fn main() -> Result<()> {
         let state = Rc::clone(&state);
         win.on_canvas_pressed(move |x, y| {
             let Some(w) = weak.upgrade() else { return };
-            let h = w.get_fits_height();
-            if h <= 0 { w.set_marker_drag_active(false); return; }
-            let fx = (x + 1.0) as f64;
-            let fy = (h as f32 - y) as f64;
             let mut s = state.borrow_mut();
-            let hit = s.active_frame().and_then(|f| hit_test_markers(&f.markers, fx, fy));
+            let xy_hit = s.active_frame().map(|f| {
+                let (fx, fy) = display_to_fits(x as f64, y as f64, f);
+                let hit = hit_test_markers(&f.markers, fx, fy);
+                (fx, fy, hit)
+            });
+            let Some((fx, fy, hit)) = xy_hit else {
+                w.set_marker_drag_active(false); return;
+            };
             match hit {
                 Some(idx) => {
                     if let Some(f) = s.active_frame_mut() { f.selected_marker = Some(idx); }

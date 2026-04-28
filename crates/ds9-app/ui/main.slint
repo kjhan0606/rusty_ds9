@@ -26,6 +26,15 @@ struct CatRow {
     mag: string,
 }
 
+// Floating text annotation (DS9 `text(x,y)` regions). Coords are in display
+// space (0-based, y-down — matches `Mark`).
+struct TextMark {
+    x: float,
+    y: float,
+    body: string,
+    color: color,
+}
+
 global Style {
     out property <color> bg-deep:    #0b0e13;
     out property <color> bg-panel:   #161b22;
@@ -454,6 +463,33 @@ export component MainWindow inherits Window {
     in-out property <bool>  histogram-visible: false;
     in-out property <bool>  contour-visible:   false;
 
+    // ---- coordinate grid overlay (WCS RA/Dec) ----
+    in-out property <image> grid-image;
+    in-out property <bool>  grid-visible: false;
+
+    // ---- line / vector / polygon / compass overlay (region shapes that don't
+    //      fit a Mark Rectangle) — baked at frame dims, scaled by view-zoom ----
+    in-out property <image> line-image;
+    in-out property <bool>  line-visible: false;
+
+    // ---- floating text annotations (DS9 `text(...)` regions) ----
+    in-out property <[TextMark]> text-marks: [];
+
+    // ---- frame-lock toggles (display-only — Rust owns the truth) ----
+    in-out property <bool> lock-zoom:  false;
+    in-out property <bool> lock-pan:   false;
+    in-out property <bool> lock-cmap:  false;
+    in-out property <bool> lock-scale: false;
+
+    // ---- session crosshair (image-display coords, set by Rust) ----
+    in-out property <bool>  crosshair-visible: false;
+    in-out property <float> crosshair-x: 0;     // display-space (0-based, y-down)
+    in-out property <float> crosshair-y: 0;
+
+    // ---- side-panel visibility ----
+    in-out property <bool>  panner-visible:    true;
+    in-out property <bool>  magnifier-visible: true;
+
     // ---- info readouts ----
     in-out property <string> info-frame:    "0/0";
     in-out property <string> info-filename: "—";
@@ -523,7 +559,9 @@ export component MainWindow inherits Window {
                 spacing: 0px;
                 MenuBarItem {
                     label: "File";
-                    items: ["Open…", "Save Image…", "Save FITS…", "—", "Print…", "—", "Quit"];
+                    items: ["Open…", "HDU Navigator…", "—",
+                            "Save Image…", "Save FITS…", "Save TIFF…", "Save JPEG…", "Save PostScript…",
+                            "—", "Print…", "—", "Quit"];
                     chosen(it) => { root.menu-action("File", it); }
                 }
                 MenuBarItem {
@@ -533,18 +571,23 @@ export component MainWindow inherits Window {
                 }
                 MenuBarItem {
                     label: "View";
-                    items: ["Info Panel", "Panner", "Magnifier", "Buttons", "Colorbar"];
+                    items: ["Panner", "Magnifier", "Coordinate Grid", "Crosshair", "—",
+                            "Info Panel", "Buttons", "Colorbar"];
                     chosen(it) => { root.menu-action("View", it); }
                 }
                 MenuBarItem {
                     label: "Frame";
                     items: ["New Frame", "Delete Frame", "—", "Next", "Previous", "—",
-                            "Match…", "Blink", "RGB Composite"];
+                            "Match…", "Blink", "RGB Composite", "—",
+                            "Rotate 180°", "Flip Horizontal", "Flip Vertical", "Reset Orientation",
+                            "—",
+                            "Lock Zoom", "Lock Pan", "Lock Color", "Lock Scale"];
                     chosen(it) => { root.menu-action("Frame", it); }
                 }
                 MenuBarItem {
                     label: "Bin";
-                    items: ["1", "2", "4", "8", "16", "32"];
+                    items: ["1", "2", "4", "8", "16", "32", "—",
+                            "Average", "Sum", "Sub-sample"];
                     chosen(it) => { root.menu-action("Bin", it); }
                 }
                 MenuBarItem {
@@ -562,7 +605,8 @@ export component MainWindow inherits Window {
                 MenuBarItem {
                     label: "Color";
                     items: ["grey", "red", "green", "blue", "—",
-                            "a", "b", "bb", "heat", "cool", "rainbow", "sls", "hsv"];
+                            "a", "b", "bb", "heat", "cool", "rainbow", "sls", "hsv", "—",
+                            "Load Custom…", "Clear Custom"];
                     chosen(it) => { root.menu-action("Color", it); }
                 }
                 MenuBarItem {
@@ -578,7 +622,8 @@ export component MainWindow inherits Window {
                 MenuBarItem {
                     label: "Analysis";
                     items: ["Pixel Table…", "Histogram…", "Statistics…", "Contour Levels…",
-                            "—", "Smooth (cycle)", "Smooth Off"];
+                            "—", "Smooth (cycle)", "Smooth Off", "—",
+                            "Smooth Gaussian", "Smooth Boxcar", "Smooth Median"];
                     chosen(it) => { root.menu-action("Analysis", it); }
                 }
                 MenuBarItem {
@@ -670,6 +715,43 @@ export component MainWindow inherits Window {
                     height: root.fits-height * 1px * root.view-zoom;
                 }
 
+                // RA/Dec coordinate grid overlay (WCS-aware, baked at frame dims)
+                if root.grid-visible: Image {
+                    source: root.grid-image;
+                    image-rendering: pixelated;
+                    x: root.view-pan-x;
+                    y: root.view-pan-y;
+                    width:  root.fits-width  * 1px * root.view-zoom;
+                    height: root.fits-height * 1px * root.view-zoom;
+                }
+
+                // session crosshair — vertical + horizontal lines through the
+                // active frame's projection of the world-locked crosshair point
+                if root.crosshair-visible: Rectangle {
+                    x: 0px;
+                    y: root.view-pan-y + root.crosshair-y * 1px * root.view-zoom - 0.5px;
+                    width: parent.width;
+                    height: 1px;
+                    background: #ff7aa3c0;
+                }
+                if root.crosshair-visible: Rectangle {
+                    x: root.view-pan-x + root.crosshair-x * 1px * root.view-zoom - 0.5px;
+                    y: 0px;
+                    width: 1px;
+                    height: parent.height;
+                    background: #ff7aa3c0;
+                }
+
+                // line / vector / polygon overlay — baked at frame dims, scaled by view-zoom
+                if root.line-visible: Image {
+                    source: root.line-image;
+                    image-rendering: pixelated;
+                    x: root.view-pan-x;
+                    y: root.view-pan-y;
+                    width:  root.fits-width  * 1px * root.view-zoom;
+                    height: root.fits-height * 1px * root.view-zoom;
+                }
+
                 // region overlays — drawn in image-pixel space then scaled by view-zoom
                 for m in root.markers: Rectangle {
                     x: root.view-pan-x + (m.cx - m.rx) * 1px * root.view-zoom;
@@ -680,6 +762,16 @@ export component MainWindow inherits Window {
                     border-color: m.selected ? Style.accent : m.color;
                     border-width: m.selected ? 2.5px : 1.5px;
                     border-radius: m.kind == 0 ? min(self.width, self.height) / 2 : 0px;
+                }
+
+                // text annotations
+                for t in root.text-marks: Text {
+                    x: root.view-pan-x + t.x * 1px * root.view-zoom + 4px;
+                    y: root.view-pan-y + t.y * 1px * root.view-zoom - 7px;
+                    text: t.body;
+                    color: t.color;
+                    font-size: 12px;
+                    font-family: Style.mono;
                 }
 
                 ta := TouchArea {
@@ -814,7 +906,7 @@ export component MainWindow inherits Window {
                 width: Style.sidebar-w;
                 padding: 4px;
                 spacing: 4px;
-                Panner {
+                if root.panner-visible: Panner {
                     caption: "PANNER";
                     height: 150px;
                     source: root.fits-image;
@@ -826,7 +918,7 @@ export component MainWindow inherits Window {
                     view-h: root.vp-h;
                     panned(ix, iy) => { root.recenter-view-on(ix, iy); }
                 }
-                Magnifier {
+                if root.magnifier-visible: Magnifier {
                     caption: "MAGNIFIER";
                     height: 150px;
                     source: root.fits-image;
