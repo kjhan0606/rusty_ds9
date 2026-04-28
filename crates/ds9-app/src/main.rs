@@ -1590,6 +1590,243 @@ FLAGS
     }
 }
 
+// ----------------------------------------------- online catalog queries --
+
+const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+fn http_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout(HTTP_TIMEOUT)
+        .user_agent("ds9-rust/0.1 (+https://github.com/anthropics/claude-code)")
+        .build()
+}
+
+/// Resolve an object name → (RA, Dec) in degrees via CDS Sesame (which itself
+/// queries SIMBAD/NED/VizieR in turn). The plain-text endpoint returns lines
+/// like `%J 202.4695833 +47.1951667 …` — we just grep for `%J`.
+fn sesame_resolve(name: &str) -> Result<(f64, f64), String> {
+    let url = format!(
+        "https://cds.unistra.fr/cgi-bin/nph-sesame/-oI/A?{}",
+        urlencode(name)
+    );
+    let body = http_agent().get(&url).call()
+        .map_err(|e| format!("sesame: {e}"))?
+        .into_string()
+        .map_err(|e| format!("sesame: read body: {e}"))?;
+    for line in body.lines() {
+        let t = line.trim();
+        let Some(rest) = t.strip_prefix("%J") else { continue };
+        let mut it = rest.split_whitespace();
+        let ra: f64 = it.next().and_then(|s| s.parse().ok())
+            .ok_or_else(|| "sesame: malformed %J (RA)".to_string())?;
+        let dec: f64 = it.next().and_then(|s| s.parse().ok())
+            .ok_or_else(|| "sesame: malformed %J (Dec)".to_string())?;
+        return Ok((ra, dec));
+    }
+    Err(format!("sesame: no %J line in response (name '{name}' unresolved)"))
+}
+
+/// Cone-search a VizieR catalog at (ra, dec) within `radius_deg`. Returns a
+/// VOTable XML body which the existing `Catalog::from_votable` parser handles.
+fn vizier_cone(ra: f64, dec: f64, radius_deg: f64, src: &str) -> Result<String, String> {
+    let url = format!(
+        "https://vizier.cds.unistra.fr/viz-bin/votable?-source={}&-c={}+{:+.6}&-c.rd={}&-out.max=500",
+        urlencode(src), ra, dec, radius_deg
+    );
+    http_agent().get(&url).call()
+        .map_err(|e| format!("vizier: {e}"))?
+        .into_string()
+        .map_err(|e| format!("vizier: read body: {e}"))
+}
+
+/// NED cone search at (ra, dec) → ASCII tab-separated table. NED's "tabular"
+/// output starts with a few preamble lines, then a `No.\tObject Name…` header
+/// row followed by data rows.
+fn ned_cone(ra: f64, dec: f64, radius_deg: f64) -> Result<String, String> {
+    // NED's classic objsearch endpoint: in_csys=Equatorial, in_equinox=J2000.0
+    let url = format!(
+        "https://ned.ipac.caltech.edu/cgi-bin/objsearch?\
+         search_type=Near+Position+Search&\
+         in_csys=Equatorial&in_equinox=J2000.0&\
+         lon={:.6}d&lat={:+.6}d&radius={:.4}&\
+         of=ascii_bar&list_limit=500",
+        ra, dec, radius_deg * 60.0  // NED expects radius in arcmin
+    );
+    let body = http_agent().get(&url).call()
+        .map_err(|e| format!("ned: {e}"))?
+        .into_string()
+        .map_err(|e| format!("ned: read body: {e}"))?;
+    // NED's `ascii_bar` is `|`-separated with a header row beginning "No.|".
+    // Convert to TSV for our existing parser.
+    let mut header_seen = false;
+    let mut out = String::new();
+    for line in body.lines() {
+        let t = line.trim_start();
+        if !header_seen {
+            if t.starts_with("No.|") || t.starts_with("No|") {
+                header_seen = true;
+                let row: String = t.split('|').map(|s| s.trim()).collect::<Vec<_>>().join("\t");
+                out.push_str(&row);
+                out.push('\n');
+            }
+            continue;
+        }
+        if t.is_empty() || !t.contains('|') { continue }
+        let row: String = t.split('|').map(|s| s.trim()).collect::<Vec<_>>().join("\t");
+        out.push_str(&row);
+        out.push('\n');
+    }
+    if out.is_empty() {
+        return Err("ned: no tabular results in response".into());
+    }
+    Ok(out)
+}
+
+/// Minimal RFC-3986-ish URL encoding for query-string values (no external
+/// crate). Encodes everything outside the unreserved set.
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' |
+            b'-' | b'.' | b'_' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+/// Returns the world coordinates of the active frame's image centre, if it
+/// has a WCS. Otherwise `None`.
+fn active_wcs_center(st: &State) -> Option<(f64, f64)> {
+    let f = st.active_frame()?;
+    let w = f.fits.wcs.as_ref()?;
+    let cx = (f.fits.width  as f64) * 0.5 + 0.5;
+    let cy = (f.fits.height as f64) * 0.5 + 0.5;
+    Some(w.pix_to_world(cx, cy))
+}
+
+fn netcat_resolve(window: &MainWindow, st: &mut State) {
+    let name = window.get_netcat_name().as_str().trim().to_string();
+    if name.is_empty() {
+        window.set_netcat_status("resolve: enter an object name first".into());
+        return;
+    }
+    window.set_netcat_status(format!("resolving '{name}' via Sesame…").into());
+    match sesame_resolve(&name) {
+        Ok((ra, dec)) => {
+            // If the active frame has a WCS, recenter the view on (ra, dec)
+            // and drop a session crosshair.
+            let placed = {
+                let info: Option<(f64, f64, f32, f32)> = st.active_frame().and_then(|f| {
+                    let wcs = f.fits.wcs.as_ref()?;
+                    let (px, py) = wcs.world_to_pix(ra, dec)?;
+                    let (dx, dy) = fits_to_display_oriented(px, py, f);
+                    Some((px, py, dx, dy))
+                });
+                if let Some((px, py, dx, dy)) = info {
+                    st.crosshair = Some(Crosshair {
+                        world: Some((ra, dec)),
+                        pixel: (st.active, px, py),
+                    });
+                    let cw = window.get_canvas_w() as f64;
+                    let ch = window.get_canvas_h() as f64;
+                    let z  = window.get_view_zoom() as f64;
+                    window.set_view_pan_x((cw * 0.5 - dx as f64 * z) as f32);
+                    window.set_view_pan_y((ch * 0.5 - dy as f64 * z) as f32);
+                    true
+                } else { false }
+            };
+            push_crosshair_to_window(window, st);
+            refresh_view(window, st);
+            let extra = if placed { "  (crosshair set)" } else { "  (no WCS to centre)" };
+            window.set_netcat_status(format!(
+                "{name} → RA {ra:.6}  Dec {dec:+.6}{extra}"
+            ).into());
+            window.set_status_text(format!(
+                "resolved {name}: ({ra:.5}, {dec:+.5}){extra}"
+            ).into());
+        }
+        Err(e) => {
+            window.set_netcat_status(e.clone().into());
+            window.set_status_text(e.into());
+        }
+    }
+}
+
+fn parse_radius(window: &MainWindow) -> Result<f64, String> {
+    let s = window.get_netcat_radius().as_str().trim().to_string();
+    s.parse::<f64>().ok()
+        .filter(|r| *r > 0.0 && *r < 30.0)
+        .ok_or_else(|| format!("invalid radius '{s}' (deg, 0 < r < 30)"))
+}
+
+fn netcat_vizier(window: &MainWindow, st: &mut State) {
+    let Some((ra, dec)) = active_wcs_center(st) else {
+        window.set_netcat_status(
+            "vizier: active frame needs a WCS (so we know where to point)".into()
+        );
+        return;
+    };
+    let radius = match parse_radius(window) { Ok(r) => r, Err(e) => {
+        window.set_netcat_status(format!("vizier: {e}").into()); return;
+    }};
+    let src = window.get_netcat_vizid().as_str().trim().to_string();
+    if src.is_empty() {
+        window.set_netcat_status("vizier: enter a catalog ID (e.g. I/345/gaia2)".into());
+        return;
+    }
+    window.set_netcat_status(format!(
+        "vizier: querying {src} @ ({ra:.4}, {dec:+.4}) r={radius} deg…"
+    ).into());
+    match vizier_cone(ra, dec, radius, &src) {
+        Ok(body) => {
+            let cat = ds9_catalog::Catalog::from_votable(&body);
+            let n = cat.len();
+            if let Some(f) = st.active_frame_mut() {
+                f.catalog = Some(cat);
+                f.selected_catalog = None;
+            }
+            refresh_view(window, st);
+            window.set_netcat_status(format!("vizier: {n} rows from {src}").into());
+            window.set_status_text(format!("vizier {src}: {n} rows").into());
+        }
+        Err(e) => {
+            window.set_netcat_status(e.clone().into());
+            window.set_status_text(e.into());
+        }
+    }
+}
+
+fn netcat_ned(window: &MainWindow, st: &mut State) {
+    let Some((ra, dec)) = active_wcs_center(st) else {
+        window.set_netcat_status("ned: active frame needs a WCS".into()); return;
+    };
+    let radius = match parse_radius(window) { Ok(r) => r, Err(e) => {
+        window.set_netcat_status(format!("ned: {e}").into()); return;
+    }};
+    window.set_netcat_status(format!(
+        "ned: querying near ({ra:.4}, {dec:+.4}) r={radius} deg…"
+    ).into());
+    match ned_cone(ra, dec, radius) {
+        Ok(tsv) => {
+            let cat = ds9_catalog::Catalog::from_tsv(&tsv);
+            let n = cat.len();
+            if let Some(f) = st.active_frame_mut() {
+                f.catalog = Some(cat);
+                f.selected_catalog = None;
+            }
+            refresh_view(window, st);
+            window.set_netcat_status(format!("ned: {n} rows").into());
+            window.set_status_text(format!("ned: {n} rows").into());
+        }
+        Err(e) => {
+            window.set_netcat_status(e.clone().into());
+            window.set_status_text(e.into());
+        }
+    }
+}
+
 fn catalog_clear(window: &MainWindow, st: &mut State) {
     if let Some(f) = st.active_frame_mut() {
         f.catalog = None;
@@ -3063,6 +3300,13 @@ fn handle_menu(window: &MainWindow, st: &mut State, menu: &str, item: &str) {
         ("Catalog", "Load…") => { catalog_load(window, st); }
         ("Catalog", "Clear") => { catalog_clear(window, st); }
         ("Catalog", "Run SExtractor…") => { run_sextractor(window, st); }
+        ("Catalog", "Online Query…") => {
+            window.set_netcat_visible(!window.get_netcat_visible());
+            window.set_status_text(
+                if window.get_netcat_visible() { "online catalog query: shown".into() }
+                else                            { "online catalog query: hidden".into() }
+            );
+        }
         ("Catalog", "Info")  => {
             let msg = match st.active_frame().and_then(|f| f.catalog.as_ref()) {
                 Some(c) => format!(
@@ -3865,6 +4109,32 @@ fn main() -> Result<()> {
             }
             populate_prefs_panel(&w, &state.borrow());
             w.set_prefs_status("reset to factory defaults (not yet applied — click Apply).".into());
+        });
+    }
+
+    // ---- Online catalog query — Resolve / VizieR / NED ----
+    {
+        let weak = win.as_weak();
+        let state = Rc::clone(&state);
+        win.on_netcat_resolve(move || {
+            let Some(w) = weak.upgrade() else { return };
+            netcat_resolve(&w, &mut state.borrow_mut());
+        });
+    }
+    {
+        let weak = win.as_weak();
+        let state = Rc::clone(&state);
+        win.on_netcat_vizier(move || {
+            let Some(w) = weak.upgrade() else { return };
+            netcat_vizier(&w, &mut state.borrow_mut());
+        });
+    }
+    {
+        let weak = win.as_weak();
+        let state = Rc::clone(&state);
+        win.on_netcat_ned(move || {
+            let Some(w) = weak.upgrade() else { return };
+            netcat_ned(&w, &mut state.borrow_mut());
         });
     }
 

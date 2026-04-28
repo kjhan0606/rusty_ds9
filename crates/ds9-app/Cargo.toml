@@ -17,6 +17,7 @@ ds9-catalog  = { workspace = true }
 anyhow       = { workspace = true }
 rfd          = "0.15"
 png          = "0.17"
+ureq         = { version = "2.10", default-features = false, features = ["tls"] }
 
 [build-dependencies]
 slint-build  = { workspace = true }

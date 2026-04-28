@@ -542,6 +542,16 @@ export component MainWindow inherits Window {
     callback prefs-save();
     callback prefs-reset();
 
+    // ---- online catalog query panel (SIMBAD / VizieR / NED) ----
+    in-out property <bool>   netcat-visible: false;
+    in-out property <string> netcat-name:    "M51";
+    in-out property <string> netcat-radius:  "0.05";
+    in-out property <string> netcat-vizid:   "I/345/gaia2";
+    in-out property <string> netcat-status:  "";
+    callback netcat-resolve();
+    callback netcat-vizier();
+    callback netcat-ned();
+
     // ---- region property editor (operates on the selected marker) ----
     in-out property <bool>   region-prop-visible: false;
     in-out property <string> region-prop-kind:    "—";
@@ -685,7 +695,7 @@ export component MainWindow inherits Window {
                 }
                 MenuBarItem {
                     label: "Catalog";
-                    items: ["Load…", "Clear", "—", "Run SExtractor…", "—", "Info"];
+                    items: ["Load…", "Clear", "—", "Run SExtractor…", "Online Query…", "—", "Info"];
                     chosen(it) => { root.menu-action("Catalog", it); }
                 }
                 MenuBarItem {
@@ -1054,6 +1064,87 @@ export component MainWindow inherits Window {
                             Button { text: "Apply"; clicked => { root.prefs-apply(); } }
                             Button { text: "Save";  clicked => { root.prefs-save(); } }
                             Button { text: "Reset"; clicked => { root.prefs-reset(); } }
+                            Rectangle { horizontal-stretch: 1; }
+                        }
+                    }
+                }
+
+                // floating online Catalog Query panel (SIMBAD / VizieR / NED)
+                if root.netcat-visible: Rectangle {
+                    x: parent.width - 432px;
+                    y: 588px;
+                    width: 420px;
+                    height: 220px;
+                    background: Style.bg-panel;
+                    border-color: Style.border-hi;
+                    border-width: 1px;
+                    border-radius: 3px;
+
+                    Text {
+                        x: 8px; y: 4px;
+                        text: "ONLINE CATALOG QUERY";
+                        color: Style.accent;
+                        font-size: 10px;
+                        font-family: Style.mono;
+                    }
+                    Rectangle {
+                        x: parent.width - 22px; y: 3px;
+                        width: 18px; height: 18px;
+                        background: ncta.has-hover ? Style.bg-hover : transparent;
+                        border-radius: 2px;
+                        Text {
+                            x: 4px; y: -1px;
+                            text: "×";
+                            color: Style.text;
+                            font-size: 14px;
+                            font-family: Style.mono;
+                        }
+                        ncta := TouchArea {
+                            clicked => { root.netcat-visible = false; }
+                        }
+                    }
+
+                    VerticalLayout {
+                        x: 8px; y: 24px;
+                        width: parent.width - 16px;
+                        height: parent.height - 32px;
+                        spacing: 4px;
+
+                        HorizontalLayout {
+                            spacing: 4px; height: 24px;
+                            Text { text: "name"; color: Style.text-dim; font-size: 11px;
+                                   font-family: Style.mono; vertical-alignment: center; width: 56px; }
+                            LineEdit { text <=> root.netcat-name;   horizontal-stretch: 1;
+                                       placeholder-text: "M51 / NGC 5194 / 3C273 …"; }
+                            Button { text: "Resolve"; clicked => { root.netcat-resolve(); } }
+                        }
+                        HorizontalLayout {
+                            spacing: 4px; height: 24px;
+                            Text { text: "radius"; color: Style.text-dim; font-size: 11px;
+                                   font-family: Style.mono; vertical-alignment: center; width: 56px; }
+                            LineEdit { text <=> root.netcat-radius; horizontal-stretch: 1;
+                                       placeholder-text: "deg (cone-search radius)"; }
+                        }
+                        HorizontalLayout {
+                            spacing: 4px; height: 24px;
+                            Text { text: "vizid"; color: Style.text-dim; font-size: 11px;
+                                   font-family: Style.mono; vertical-alignment: center; width: 56px; }
+                            LineEdit { text <=> root.netcat-vizid;  horizontal-stretch: 1;
+                                       placeholder-text: "VizieR catalog ID e.g. I/345/gaia2"; }
+                        }
+
+                        Text {
+                            text: root.netcat-status;
+                            color: Style.text-dim;
+                            font-size: 10px;
+                            font-family: Style.mono;
+                            wrap: word-wrap;
+                        }
+
+                        HorizontalLayout {
+                            spacing: 6px; height: 26px;
+                            Button { text: "VizieR Cone"; clicked => { root.netcat-vizier(); } }
+                            Button { text: "NED Cone";    clicked => { root.netcat-ned(); } }
                             Rectangle { horizontal-stretch: 1; }
                         }
                     }
