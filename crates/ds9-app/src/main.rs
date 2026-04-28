@@ -494,6 +494,60 @@ fn hit_test_markers(markers: &[Marker], fx: f64, fy: f64) -> Option<usize> {
     None
 }
 
+/// Display-space axis-aligned bounding box of a marker, using the active
+/// frame's orientation. Returns (min_dx, min_dy, max_dx, max_dy).
+fn marker_display_bbox(m: &Marker, f: &Frame) -> (f64, f64, f64, f64) {
+    // Sample the shape's outline (or center+extent) into FITS coords, then
+    // project each point through fits_to_display_oriented.
+    let mut pts: Vec<(f64, f64)> = Vec::new();
+    match &m.shape {
+        MShape::Circle { center, r } | MShape::Annulus { center, r_outer: r, .. } => {
+            for k in 0..36 {
+                let t = k as f64 * std::f64::consts::TAU / 36.0;
+                pts.push((center.x + r * t.cos(), center.y + r * t.sin()));
+            }
+        }
+        MShape::Box { center, w, h, theta_deg } => {
+            let (hw, hh) = (w * 0.5, h * 0.5);
+            let (s, c) = (theta_deg.to_radians().sin(), theta_deg.to_radians().cos());
+            for (sx, sy) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
+                let (lx, ly) = (sx * hw, sy * hh);
+                pts.push((center.x + lx * c - ly * s, center.y + lx * s + ly * c));
+            }
+        }
+        MShape::Ellipse { center, a, b, theta_deg } => {
+            let (s, c) = (theta_deg.to_radians().sin(), theta_deg.to_radians().cos());
+            for k in 0..36 {
+                let t = k as f64 * std::f64::consts::TAU / 36.0;
+                let (lx, ly) = (a * t.cos(), b * t.sin());
+                pts.push((center.x + lx * c - ly * s, center.y + lx * s + ly * c));
+            }
+        }
+        MShape::Polygon { points } => {
+            for p in points { pts.push((p.x, p.y)); }
+        }
+        MShape::Line { from, to } => {
+            pts.push((from.x, from.y));
+            pts.push((to.x, to.y));
+        }
+        MShape::Point { center } | MShape::Compass { center, .. } | MShape::Text { center, .. } => {
+            // small surround so the box has area
+            for d in [(-2.0, -2.0), (2.0, -2.0), (2.0, 2.0), (-2.0, 2.0)] {
+                pts.push((center.x + d.0, center.y + d.1));
+            }
+        }
+    }
+    let mut mnx = f64::INFINITY;  let mut mxx = f64::NEG_INFINITY;
+    let mut mny = f64::INFINITY;  let mut mxy = f64::NEG_INFINITY;
+    for (fx, fy) in pts {
+        let (dx, dy) = fits_to_display_oriented(fx, fy, f);
+        let (dx, dy) = (dx as f64, dy as f64);
+        if dx < mnx { mnx = dx; }  if dx > mxx { mxx = dx; }
+        if dy < mny { mny = dy; }  if dy > mxy { mxy = dy; }
+    }
+    (mnx, mny, mxx, mxy)
+}
+
 /// Translate a marker's geometry by (dx, dy) in FITS pixels.
 fn translate_marker(m: &mut Marker, dx: f64, dy: f64) {
     use ds9_marker::PixelPos;
@@ -689,6 +743,97 @@ fn render_histogram_image(f: &Frame, w: usize, h: usize) -> Image {
             }
         }
     }
+    Image::from_rgba8(buf)
+}
+
+/// Sample pixel values along a straight line in FITS-pixel space at 1-pixel
+/// steps (nearest-neighbor). Returns (samples, length_in_pixels).
+fn sample_line(f: &Frame, x0: f64, y0: f64, x1: f64, y1: f64) -> (Vec<f32>, f64) {
+    let (w, h) = (f.fits.width, f.fits.height);
+    let dx = x1 - x0;
+    let dy = y1 - y0;
+    let len = (dx * dx + dy * dy).sqrt();
+    let n = (len.ceil() as usize).max(2);
+    let mut out: Vec<f32> = Vec::with_capacity(n);
+    for i in 0..n {
+        let t = i as f64 / (n - 1) as f64;
+        // FITS coords are 1-based; storage indices are 0-based.
+        let fx = x0 + dx * t;
+        let fy = y0 + dy * t;
+        let ix = (fx - 1.0).round() as isize;
+        // FITS y is bottom-up → flip to storage y (top-down).
+        let iy_disp = (h as isize) - 1 - ((fy - 1.0).round() as isize);
+        let v = if ix >= 0 && (ix as usize) < w && iy_disp >= 0 && (iy_disp as usize) < h {
+            f.fits.data[(iy_disp as usize) * w + (ix as usize)]
+        } else {
+            f32::NAN
+        };
+        out.push(v);
+    }
+    (out, len)
+}
+
+/// Render a 1D line plot of `samples` (pixel value vs distance index) into a
+/// w×h RGBA image. Caption embeds basic stats for the user.
+fn render_line_plot(samples: &[f32], w: usize, h: usize) -> Image {
+    let mut buf = SharedPixelBuffer::<Rgba8Pixel>::new(w as u32, h as u32);
+    let bytes = buf.make_mut_bytes();
+    for px in bytes.chunks_exact_mut(4) {
+        px[0] = 0x0f; px[1] = 0x13; px[2] = 0x19; px[3] = 0xff;
+    }
+    let put = |bytes: &mut [u8], x: usize, y: usize, c: [u8; 4]| {
+        if x < w && y < h {
+            let i = (y * w + x) * 4;
+            bytes[i..i+4].copy_from_slice(&c);
+        }
+    };
+    let frame = [0x2a, 0x32, 0x42, 0xff];
+    for x in 0..w { put(bytes, x, 0, frame); put(bytes, x, h-1, frame); }
+    for y in 0..h { put(bytes, 0, y, frame); put(bytes, w-1, y, frame); }
+
+    let finite: Vec<f32> = samples.iter().copied().filter(|v| v.is_finite()).collect();
+    if finite.is_empty() || samples.len() < 2 { return Image::from_rgba8(buf); }
+
+    let mut lo = f32::INFINITY;
+    let mut hi = f32::NEG_INFINITY;
+    for &v in &finite {
+        if v < lo { lo = v; }
+        if v > hi { hi = v; }
+    }
+    let span = (hi - lo).max(f32::EPSILON);
+
+    let pad_x = 6usize;
+    let pad_y = 8usize;
+    let plot_w = w.saturating_sub(pad_x * 2).max(1);
+    let plot_h = h.saturating_sub(pad_y * 2).max(1);
+    let n = samples.len();
+    let line = [0x4e, 0xc9, 0xb0, 0xff];
+
+    // Bresenham polyline
+    let mut prev: Option<(i32, i32)> = None;
+    let draw_seg = |bytes: &mut [u8], (mut x, mut y): (i32, i32), (x1, y1): (i32, i32), c: [u8; 4]| {
+        let dx =  (x1 - x).abs();
+        let dy = -(y1 - y).abs();
+        let sx = if x < x1 { 1 } else { -1 };
+        let sy = if y < y1 { 1 } else { -1 };
+        let mut err = dx + dy;
+        loop {
+            if x >= 0 && y >= 0 { put(bytes, x as usize, y as usize, c); }
+            if x == x1 && y == y1 { break; }
+            let e2 = 2 * err;
+            if e2 >= dy { err += dy; x += sx; }
+            if e2 <= dx { err += dx; y += sy; }
+        }
+    };
+    for (i, &v) in samples.iter().enumerate() {
+        if !v.is_finite() { prev = None; continue; }
+        let xf = pad_x as f64 + (i as f64) * (plot_w as f64) / ((n - 1) as f64);
+        let yf = pad_y as f64 + (1.0 - ((v - lo) / span) as f64) * (plot_h as f64);
+        let cur = (xf.round() as i32, yf.round() as i32);
+        if let Some(p) = prev { draw_seg(bytes, p, cur, line); }
+        prev = Some(cur);
+    }
+
     Image::from_rgba8(buf)
 }
 
@@ -1969,6 +2114,39 @@ fn handle_menu(window: &MainWindow, st: &mut State, menu: &str, item: &str) {
                 refresh_view(window, st);
             }
         }
+        ("Region", "Projection…") => {
+            // Pick a Line marker — selected one if it's a Line, otherwise the
+            // first Line in the marker list.
+            let line: Option<((f64, f64), (f64, f64))> = st.active_frame().and_then(|f| {
+                let pick = f.selected_marker
+                    .and_then(|i| f.markers.get(i))
+                    .filter(|m| matches!(m.shape, MShape::Line { .. }))
+                    .or_else(|| f.markers.iter().find(|m| matches!(m.shape, MShape::Line { .. })));
+                pick.and_then(|m| match &m.shape {
+                    MShape::Line { from, to } => Some(((from.x, from.y), (to.x, to.y))),
+                    _ => None,
+                })
+            });
+            let Some((p0, p1)) = line else {
+                window.set_status_text(
+                    "projection: load or draw a Line region first (use Region ▸ Load…)".into()
+                );
+                return;
+            };
+            let Some(f) = st.active_frame() else { return };
+            let (samples, len) = sample_line(f, p0.0, p0.1, p1.0, p1.1);
+            window.set_projection_image(render_line_plot(&samples, 760, 420));
+            let finite = samples.iter().filter(|v| v.is_finite()).count();
+            window.set_projection_caption(format!(
+                "PROJECTION  len={:.1} px  n={}/{}", len, finite, samples.len()
+            ).into());
+            let on = !window.get_projection_visible();
+            window.set_projection_visible(on);
+            window.set_status_text(
+                if on { format!("projection: {} samples along {:.1} px", samples.len(), len).into() }
+                else  { "projection: hidden".into() }
+            );
+        }
         ("Region", "Info")   => {
             let msg = match st.active_frame() {
                 Some(f) => {
@@ -2152,6 +2330,51 @@ fn handle_menu(window: &MainWindow, st: &mut State, menu: &str, item: &str) {
             }
         }
 
+        // Edit
+        ("Edit", "Crop to Selected") => {
+            let Some(f) = st.active_frame() else {
+                window.set_status_text("crop: no active frame".into()); return;
+            };
+            // Prefer the selected marker; otherwise use the bounding box of all
+            // markers that have one. If still nothing, bail.
+            let bbox: Option<(f64, f64, f64, f64)> = f.selected_marker
+                .and_then(|i| f.markers.get(i))
+                .map(|m| marker_display_bbox(m, f))
+                .or_else(|| {
+                    if f.markers.is_empty() { return None; }
+                    let mut acc: Option<(f64, f64, f64, f64)> = None;
+                    for m in &f.markers {
+                        let b = marker_display_bbox(m, f);
+                        acc = Some(match acc {
+                            None => b,
+                            Some(a) => (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3)),
+                        });
+                    }
+                    acc
+                });
+            let Some((mnx, mny, mxx, mxy)) = bbox else {
+                window.set_status_text(
+                    "crop: select a region first (or load some — Region ▸ Load…)".into()
+                );
+                return;
+            };
+            let bw = (mxx - mnx).max(1.0);
+            let bh = (mxy - mny).max(1.0);
+            // canvas-w / canvas-h are slint `length` props (logical px) → f32.
+            let cw = window.get_canvas_w() as f64;
+            let ch = window.get_canvas_h() as f64;
+            let zoom = ((cw / bw).min(ch / bh) as f32).clamp(0.02, 64.0);
+            let cx = 0.5 * (mnx + mxx);
+            let cy = 0.5 * (mny + mxy);
+            window.set_view_zoom(zoom);
+            window.set_view_pan_x((cw * 0.5 - cx * zoom as f64) as f32);
+            window.set_view_pan_y((ch * 0.5 - cy * zoom as f64) as f32);
+            window.set_status_text(format!(
+                "crop: {:.0}×{:.0} px → zoom {:.2}×", bw, bh, zoom
+            ).into());
+        }
+        ("Edit", "Reset Crop") => { handle_menu(window, st, "Zoom", "Reset"); }
+
         ("Help", "About ds9-rust") => {
             window.set_status_text(
                 "ds9-rust 0.1 — slint port of SAOImage DS9 (Smithsonian Astrophysical Observatory)"
@@ -2227,6 +2450,9 @@ fn dispatch_ipc(window: &MainWindow, st: &mut State, line: &str) -> String {
             run_sextractor(window, st);
             "ok".into()
         }
+        ["crop"]       => { handle_menu(window, st, "Edit", "Crop to Selected"); "ok".into() }
+        ["crop", "reset"] => { handle_menu(window, st, "Edit", "Reset Crop"); "ok".into() }
+        ["projection"] => { handle_menu(window, st, "Region", "Projection…"); "ok".into() }
         ["value"] => {
             let cx = window.get_cursor_image_x() as i32;
             let cy = window.get_cursor_image_y() as i32;
@@ -2238,7 +2464,7 @@ fn dispatch_ipc(window: &MainWindow, st: &mut State, line: &str) -> String {
                 } else { "err out of bounds".into() }
             } else { "err no frame".into() }
         }
-        ["help"] => "commands: quit | frame next|previous|N | scale S | cmap C | bin N | zoom in|out|fit|N | region load|save P | file open P | save png|fits P | value | sextractor | help".into(),
+        ["help"] => "commands: quit | frame next|previous|N | scale S | cmap C | bin N | zoom in|out|fit|N | region load|save P | file open P | save png|fits P | value | sextractor | crop [reset] | projection | help".into(),
         _ => format!("err unknown: {line}"),
     }
 }

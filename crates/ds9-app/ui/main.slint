@@ -460,8 +460,11 @@ export component MainWindow inherits Window {
     // ---- analysis overlays ----
     in-out property <image> histogram-image;
     in-out property <image> contour-image;
-    in-out property <bool>  histogram-visible: false;
-    in-out property <bool>  contour-visible:   false;
+    in-out property <image> projection-image;
+    in-out property <bool>  histogram-visible:  false;
+    in-out property <bool>  contour-visible:    false;
+    in-out property <bool>  projection-visible: false;
+    in-out property <string> projection-caption: "PROJECTION";
 
     // ---- coordinate grid overlay (WCS RA/Dec) ----
     in-out property <image> grid-image;
@@ -566,7 +569,8 @@ export component MainWindow inherits Window {
                 }
                 MenuBarItem {
                     label: "Edit";
-                    items: ["Undo", "Redo", "—", "Cut", "Copy", "Paste"];
+                    items: ["Undo", "Redo", "—", "Cut", "Copy", "Paste", "—",
+                            "Crop to Selected", "Reset Crop"];
                     chosen(it) => { root.menu-action("Edit", it); }
                 }
                 MenuBarItem {
@@ -611,7 +615,8 @@ export component MainWindow inherits Window {
                 }
                 MenuBarItem {
                     label: "Region";
-                    items: ["New", "Load…", "Save…", "—", "Delete Selected", "Delete All", "—", "Info"];
+                    items: ["New", "Load…", "Save…", "—", "Delete Selected", "Delete All", "—",
+                            "Projection…", "—", "Info"];
                     chosen(it) => { root.menu-action("Region", it); }
                 }
                 MenuBarItem {
@@ -895,6 +900,50 @@ export component MainWindow inherits Window {
                         width:  parent.width  - 16px;
                         height: parent.height - 32px;
                         source: root.histogram-image;
+                        image-fit: fill;
+                        image-rendering: smooth;
+                    }
+                }
+
+                // floating projection panel (1D pixel profile along a Line region)
+                if root.projection-visible: Rectangle {
+                    x: parent.width - 412px;
+                    y: parent.height - 250px;
+                    width: 400px;
+                    height: 230px;
+                    background: Style.bg-panel;
+                    border-color: Style.border-hi;
+                    border-width: 1px;
+                    border-radius: 3px;
+
+                    Text {
+                        x: 8px; y: 4px;
+                        text: root.projection-caption;
+                        color: Style.accent;
+                        font-size: 10px;
+                        font-family: Style.mono;
+                    }
+                    Rectangle {
+                        x: parent.width - 22px; y: 3px;
+                        width: 18px; height: 18px;
+                        background: pcta.has-hover ? Style.bg-hover : transparent;
+                        border-radius: 2px;
+                        Text {
+                            x: 4px; y: -1px;
+                            text: "×";
+                            color: Style.text;
+                            font-size: 14px;
+                            font-family: Style.mono;
+                        }
+                        pcta := TouchArea {
+                            clicked => { root.projection-visible = false; }
+                        }
+                    }
+                    Image {
+                        x: 8px; y: 24px;
+                        width:  parent.width  - 16px;
+                        height: parent.height - 32px;
+                        source: root.projection-image;
                         image-fit: fill;
                         image-rendering: smooth;
                     }
