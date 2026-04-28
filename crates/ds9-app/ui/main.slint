@@ -95,19 +95,26 @@ component MenuBarItem inherits Rectangle {
     popup := PopupWindow {
         x: 0px;
         y: root.height;
+        width:  220px;
+        height: root.items.length * 22px + 8px;
         close-policy: close-on-click-outside;
         Rectangle {
+            width: parent.width;
+            height: parent.height;
             background: Style.bg-panel;
             border-color: Style.border-hi;
             border-width: 1px;
             // shadow rule on top to anchor it visually under the menubar accent
-            Rectangle { y: 0px; height: 1px; background: Style.accent-dim; }
+            Rectangle { x: 0px; y: 0px; width: parent.width; height: 1px; background: Style.accent-dim; }
             VerticalLayout {
+                x: 0px; y: 0px;
+                width:  parent.width;
+                height: parent.height;
                 padding-top:    4px;
                 padding-bottom: 4px;
                 spacing: 0px;
                 for item in root.items: Rectangle {
-                    height: item == "—" ? 7px : 22px;
+                    height: 22px;
                     background: item == "—"
                         ? transparent
                         : (itemta.has-hover ? Style.bg-hover : transparent);
@@ -118,6 +125,9 @@ component MenuBarItem inherits Rectangle {
                         background: Style.border;
                     }
                     if item != "—" : HorizontalLayout {
+                        x: 0px; y: 0px;
+                        width:  parent.width;
+                        height: parent.height;
                         padding-left:  14px;
                         padding-right: 14px;
                         Text {
