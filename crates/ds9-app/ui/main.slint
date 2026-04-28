@@ -884,16 +884,21 @@ export component MainWindow inherits Window {
                                     (self.mouse-y - root.view-pan-y) / 1px / root.view-zoom);
                             }
                         }
+                        if (e.kind == PointerEventKind.move) {
+                            // Hover tracking — drives the magnifier and info row.
+                            // (TouchArea.moved fires only while pressed, which is
+                            // why the magnifier used to update only after a click.)
+                            if (root.view-zoom > 0) {
+                                root.cursor-image-x =
+                                    (self.mouse-x - root.view-pan-x) / 1px / root.view-zoom;
+                                root.cursor-image-y =
+                                    (self.mouse-y - root.view-pan-y) / 1px / root.view-zoom;
+                                root.canvas-mouse-move(root.cursor-image-x, root.cursor-image-y);
+                            }
+                        }
                     }
                     moved => {
-                        // image-space cursor coords for the info row + magnifier
-                        if (root.view-zoom > 0) {
-                            root.cursor-image-x =
-                                (self.mouse-x - root.view-pan-x) / 1px / root.view-zoom;
-                            root.cursor-image-y =
-                                (self.mouse-y - root.view-pan-y) / 1px / root.view-zoom;
-                            root.canvas-mouse-move(root.cursor-image-x, root.cursor-image-y);
-                        }
+                        // Press-drag pan only; hover tracking is in pointer-event.
                         if (self.dragging) {
                             root.view-pan-x += self.mouse-x - self.last-x;
                             root.view-pan-y += self.mouse-y - self.last-y;
