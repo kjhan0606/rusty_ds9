@@ -623,7 +623,9 @@ export component MainWindow inherits Window {
                     label: "File";
                     items: ["Open…", "HDU Navigator…", "Next HDU", "—",
                             "Save Image…", "Save FITS…", "Save TIFF…", "Save JPEG…", "Save PostScript…",
-                            "—", "Print…", "—", "Quit"];
+                            "—", "Print…", "—",
+                            "SAMP Send Image", "SAMP Send VOTable…",
+                            "—", "Quit"];
                     chosen(it) => { root.menu-action("File", it); }
                 }
                 MenuBarItem {

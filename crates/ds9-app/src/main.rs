@@ -1590,6 +1590,232 @@ FLAGS
     }
 }
 
+// -------------------------------------------------------- SAMP (outbound) --
+
+/// Locate the per-user SAMP hub lockfile. Standard locations are
+/// `$SAMP_HUB` (URL-style hint), `~/.samp`, or `$XDG_RUNTIME_DIR/samp/...`.
+/// We only support the classic plain-file case here.
+fn samp_lockfile_path() -> Option<PathBuf> {
+    if let Some(env) = env::var_os("SAMP_HUB") {
+        let s = env.to_string_lossy().to_string();
+        if let Some(rest) = s.strip_prefix("std-lockurl:file://") {
+            return Some(PathBuf::from(rest));
+        }
+        if !s.is_empty() && !s.contains("://") {
+            return Some(PathBuf::from(s));
+        }
+    }
+    let home = env::var_os("HOME").map(PathBuf::from)?;
+    Some(home.join(".samp"))
+}
+
+/// Parse the SAMP lockfile (`key=value` per line, `#` comments). Returns
+/// (xmlrpc_url, secret) — both required to register.
+fn samp_read_lockfile() -> Result<(String, String), String> {
+    let p = samp_lockfile_path().ok_or_else(|| "samp: no $HOME".to_string())?;
+    let body = std::fs::read_to_string(&p)
+        .map_err(|e| format!("samp: read {}: {e}", p.display()))?;
+    let mut url = None;
+    let mut secret = None;
+    for line in body.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') { continue; }
+        let Some((k, v)) = t.split_once('=') else { continue };
+        match k.trim() {
+            "samp.hub.xmlrpc.url" => url = Some(v.trim().to_string()),
+            "samp.secret"         => secret = Some(v.trim().to_string()),
+            _ => {}
+        }
+    }
+    match (url, secret) {
+        (Some(u), Some(s)) => Ok((u, s)),
+        _ => Err("samp: lockfile missing xmlrpc url or secret (no hub running?)".into()),
+    }
+}
+
+/// Escape a string for XML PCDATA / attribute values.
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+        .replace('"', "&quot;").replace('\'', "&apos;")
+}
+
+/// Tiny XML-RPC value serialiser. Supports just the types SAMP uses:
+/// string, struct (BTreeMap-like Vec<(K,V)>), and array.
+enum XV<'a> {
+    Str(&'a str),
+    Map(Vec<(&'a str, XV<'a>)>),
+}
+
+fn xv_to_xml(v: &XV) -> String {
+    match v {
+        XV::Str(s) => format!("<value><string>{}</string></value>", xml_escape(s)),
+        XV::Map(items) => {
+            let mut out = String::from("<value><struct>");
+            for (k, val) in items {
+                out.push_str("<member><name>");
+                out.push_str(&xml_escape(k));
+                out.push_str("</name>");
+                out.push_str(&xv_to_xml(val));
+                out.push_str("</member>");
+            }
+            out.push_str("</struct></value>");
+            out
+        }
+    }
+}
+
+fn xmlrpc_call(url: &str, method: &str, params: &[XV]) -> Result<String, String> {
+    let mut body = String::from("<?xml version=\"1.0\"?><methodCall><methodName>");
+    body.push_str(&xml_escape(method));
+    body.push_str("</methodName><params>");
+    for p in params {
+        body.push_str("<param>");
+        body.push_str(&xv_to_xml(p));
+        body.push_str("</param>");
+    }
+    body.push_str("</params></methodCall>");
+    http_agent().post(url)
+        .set("Content-Type", "text/xml")
+        .send_string(&body)
+        .map_err(|e| format!("xml-rpc: {e}"))?
+        .into_string()
+        .map_err(|e| format!("xml-rpc: read body: {e}"))
+}
+
+/// Pull the value of struct member `key` out of an XML-RPC `<struct>`
+/// response. Naive substring search — fine for SAMP's flat hub-id /
+/// private-key responses.
+fn xmlrpc_struct_str(body: &str, key: &str) -> Option<String> {
+    let needle = format!("<name>{key}</name>");
+    let i = body.find(&needle)?;
+    let rest = &body[i + needle.len()..];
+    let v_start = rest.find("<string>")? + "<string>".len();
+    let v_end = rest[v_start..].find("</string>")?;
+    Some(rest[v_start..v_start + v_end].to_string())
+}
+
+fn samp_register(url: &str, secret: &str) -> Result<String, String> {
+    let body = xmlrpc_call(url, "samp.hub.register", &[XV::Str(secret)])?;
+    if body.contains("<fault>") {
+        return Err(format!("samp: register fault: {body}"));
+    }
+    xmlrpc_struct_str(&body, "samp.private-key")
+        .ok_or_else(|| format!("samp: register response missing samp.private-key: {body}"))
+}
+
+fn samp_unregister(url: &str, priv_key: &str) {
+    // best-effort
+    let _ = xmlrpc_call(url, "samp.hub.unregister", &[XV::Str(priv_key)]);
+}
+
+fn samp_declare_metadata(url: &str, priv_key: &str) -> Result<(), String> {
+    let meta = XV::Map(vec![
+        ("samp.name",         XV::Str("ds9-rust")),
+        ("samp.description.text", XV::Str("ds9-rust — slint port of SAOImage DS9")),
+        ("ds9-rust.version",  XV::Str("0.1")),
+    ]);
+    xmlrpc_call(url, "samp.hub.declareMetadata", &[XV::Str(priv_key), meta])?;
+    Ok(())
+}
+
+/// Fire a notify-all of the given mtype + params struct. SAMP's hub fans it
+/// out to every subscribed client; we do not wait for individual responses.
+fn samp_notify_all(url: &str, priv_key: &str, mtype: &str, params: Vec<(&str, XV)>) -> Result<(), String> {
+    let msg = XV::Map(vec![
+        ("samp.mtype",  XV::Str(mtype)),
+        ("samp.params", XV::Map(params)),
+    ]);
+    let body = xmlrpc_call(url, "samp.hub.notifyAll", &[XV::Str(priv_key), msg])?;
+    if body.contains("<fault>") {
+        return Err(format!("samp: notifyAll fault: {body}"));
+    }
+    Ok(())
+}
+
+/// Convert a local filesystem path to a `file://` URL. Doesn't try to be
+/// clever about Windows; this binary only builds on linux/macOS anyway.
+fn path_to_file_url(p: &Path) -> String {
+    let abs = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let s = abs.to_string_lossy().replace('\\', "/");
+    let mut enc = String::from("file://");
+    for ch in s.chars() {
+        match ch {
+            '/' | 'A'..='Z' | 'a'..='z' | '0'..='9' |
+            '-' | '.' | '_' | '~' | ':' => enc.push(ch),
+            _ => {
+                let mut b = [0u8; 4];
+                for byte in ch.encode_utf8(&mut b).bytes() {
+                    enc.push_str(&format!("%{:02X}", byte));
+                }
+            }
+        }
+    }
+    enc
+}
+
+/// Send `image.load.fits` for the active frame's source FITS file.
+fn samp_send_active_image(window: &MainWindow, st: &State) {
+    let Some(f) = st.active_frame() else {
+        window.set_status_text("samp: no active frame".into()); return;
+    };
+    let Some(path) = f.source_path.as_ref() else {
+        window.set_status_text("samp: active frame is synthetic (no path)".into()); return;
+    };
+    let (url, secret) = match samp_read_lockfile() {
+        Ok(x) => x, Err(e) => { window.set_status_text(e.into()); return; }
+    };
+    let key = match samp_register(&url, &secret) {
+        Ok(k) => k, Err(e) => { window.set_status_text(e.into()); return; }
+    };
+    let _ = samp_declare_metadata(&url, &key);
+
+    let furl = path_to_file_url(path);
+    let name = f.name.clone();
+    let res = samp_notify_all(&url, &key, "image.load.fits", vec![
+        ("url",  XV::Str(&furl)),
+        ("name", XV::Str(&name)),
+    ]);
+    samp_unregister(&url, &key);
+
+    match res {
+        Ok(()) => window.set_status_text(
+            format!("samp: image.load.fits sent ({})", path.display()).into()
+        ),
+        Err(e) => window.set_status_text(e.into()),
+    }
+}
+
+/// Send `table.load.votable` for a VOTable file the user picks.
+fn samp_send_votable(window: &MainWindow) {
+    let chosen: Option<PathBuf> = rfd::FileDialog::new()
+        .set_title("Send VOTable via SAMP (table.load.votable)")
+        .add_filter("VOTable", &["xml", "vot", "votable"])
+        .add_filter("All", &["*"])
+        .pick_file();
+    let Some(p) = chosen else { return };
+    let (url, secret) = match samp_read_lockfile() {
+        Ok(x) => x, Err(e) => { window.set_status_text(e.into()); return; }
+    };
+    let key = match samp_register(&url, &secret) {
+        Ok(k) => k, Err(e) => { window.set_status_text(e.into()); return; }
+    };
+    let _ = samp_declare_metadata(&url, &key);
+    let furl = path_to_file_url(&p);
+    let name = p.file_name().map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "table".into());
+    let res = samp_notify_all(&url, &key, "table.load.votable", vec![
+        ("url",  XV::Str(&furl)),
+        ("name", XV::Str(&name)),
+    ]);
+    samp_unregister(&url, &key);
+    match res {
+        Ok(()) => window.set_status_text(
+            format!("samp: table.load.votable sent ({})", p.display()).into()
+        ),
+        Err(e) => window.set_status_text(e.into()),
+    }
+}
+
 // ----------------------------------------------- online catalog queries --
 
 const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
@@ -2881,6 +3107,8 @@ fn handle_menu(window: &MainWindow, st: &mut State, menu: &str, item: &str) {
                 Err(e) => window.set_status_text(format!("print: {e}").into()),
             }
         }
+        ("File", "SAMP Send Image")    => samp_send_active_image(window, st),
+        ("File", "SAMP Send VOTable…") => samp_send_votable(window),
         ("File", "Quit")  => { let _ = slint::quit_event_loop(); }
 
         // View — sidebar panel toggles and overlays
@@ -3552,6 +3780,8 @@ fn dispatch_ipc(window: &MainWindow, st: &mut State, line: &str) -> String {
         ["quit"] => { let _ = slint::quit_event_loop(); "ok".into() }
         ["frame", "mosaic"]    => { handle_menu(window, st, "Frame", "Mosaic WCS"); "ok".into() }
         ["frame", "tile"]      => { handle_menu(window, st, "Frame", "Tile Frames"); "ok".into() }
+        ["samp", "image"]      => { handle_menu(window, st, "File", "SAMP Send Image"); "ok".into() }
+        ["samp", "votable"]    => { handle_menu(window, st, "File", "SAMP Send VOTable…"); "ok".into() }
         ["frame", "next"]      => { handle_menu(window, st, "Frame", "Next"); "ok".into() }
         ["frame", "previous"]  => { handle_menu(window, st, "Frame", "Previous"); "ok".into() }
         ["frame", n] => {
