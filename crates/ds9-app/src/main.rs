@@ -137,6 +137,13 @@ struct Frame {
     /// 3-D cube projection mode. Has no effect when `fits.cube` is `None`
     /// (regular 2-D image). On change, `apply_cube_mode` rewrites `fits.data`.
     cube_mode: CubeMode,
+    /// Trim mask, parallel to the *kept* catalog rows produced by
+    /// `build_catalog_model`. `false` rows are filtered out by the current
+    /// trim expression. Resized whenever the catalog is replaced.
+    cat_trim: Vec<bool>,
+    /// Per-row OGFinder-style classification tag: "" / "M" merge / "S" split /
+    /// "A" added / "F" flagged. Parallel to the kept rows.
+    cat_tag: Vec<String>,
 }
 
 impl Frame {
@@ -164,7 +171,19 @@ impl Frame {
             custom_lut: None,
             hdu_idx: 0,
             cube_mode: CubeMode::default(),
+            cat_trim: Vec::new(),
+            cat_tag: Vec::new(),
         }
+    }
+
+    /// Sync `cat_trim` / `cat_tag` to the current catalog row count. Called
+    /// after any assignment to `catalog` so the parallel arrays stay sized.
+    fn sync_catalog_aux(&mut self) {
+        let n = self.catalog.as_ref().map(|c| c.len()).unwrap_or(0);
+        self.cat_trim.resize(n, true);
+        self.cat_tag.resize(n, String::new());
+        if self.cat_trim.len() > n { self.cat_trim.truncate(n); }
+        if self.cat_tag.len()  > n { self.cat_tag.truncate(n); }
     }
 
     fn limits(&self) -> Limits {
@@ -259,6 +278,19 @@ struct State {
     /// grid instead of just the active one. Clicking a tile selects it
     /// and exits tile mode.
     tile_mode: bool,
+    /// Optional weak handle to the standalone Catalog window. Set during
+    /// startup; refresh_view pushes the active frame's catalog into both
+    /// the main window's inline panel and this window when it's alive.
+    cat_window: Option<slint::Weak<CatalogWindow>>,
+    /// Visible-Filter toggle on the standalone Catalog window — when on,
+    /// rows whose (x, y) fall outside the main canvas viewport are dimmed
+    /// out (rendered with 0 height) instead of removed, so indices stay
+    /// stable.
+    cat_visible_filter: bool,
+    /// Last cursor position in FITS coordinates (active frame). Updated on
+    /// every canvas hover; consumed by single-key shortcuts (A/D/S) so the
+    /// keystroke applies to whatever the user was pointing at.
+    last_hover_fits: Option<(f64, f64)>,
 }
 
 impl State {
@@ -275,6 +307,9 @@ impl State {
             lock_scale: false,
             prefs: Prefs::default(),
             tile_mode: false,
+            cat_window: None,
+            cat_visible_filter: false,
+            last_hover_fits: None,
         }
     }
 
@@ -747,16 +782,14 @@ fn mag_column(cat: &Catalog) -> Option<usize> {
     NAMES.iter().find_map(|n| cat.col_index(n))
 }
 
-fn build_catalog_model(f: &Frame) -> ModelRc<CatRow> {
-    let Some(cat) = &f.catalog else {
-        return ModelRc::new(VecModel::from(Vec::<CatRow>::new()));
-    };
+fn build_catalog_rows(f: &Frame, viewport: Option<(f64, f64, f64, f64)>) -> Vec<CatRow> {
+    let Some(cat) = &f.catalog else { return Vec::new(); };
     let id_idx = cat.col_index("NUMBER").or_else(|| cat.col_index("ID"));
     let mag_idx = mag_column(cat);
     let xy = cat.xy_columns();
-    let Some((xi, yi)) = xy else {
-        return ModelRc::new(VecModel::from(Vec::<CatRow>::new()));
-    };
+    let Some((xi, yi)) = xy else { return Vec::new(); };
+    // Per-row `visible` flag = (in-viewport) AND (passes trim) — used by the
+    // standalone catalog window's Visible-Filter toggle and the inline panel.
     let mut out: Vec<CatRow> = Vec::with_capacity(cat.len().min(5000));
     let mut row_kept = 0usize;
     for (raw_idx, row) in cat.rows.iter().enumerate() {
@@ -774,10 +807,39 @@ fn build_catalog_model(f: &Frame) -> ModelRc<CatRow> {
                 .unwrap_or_else(|| "—".into()),
             None => "—".into(),
         };
-        out.push(CatRow { id: id.into(), x: x as f32, y: y as f32, mag: mag.into() });
+        let (ra_s, dec_s) = match f.fits.wcs.as_ref() {
+            Some(w) => {
+                let (ra, dec) = w.pix_to_world(x, y);
+                let s = ds9_fits::format_sexagesimal(ra, dec);
+                let mut it = s.splitn(2, ' ');
+                (it.next().unwrap_or("").to_string(),
+                 it.next().unwrap_or("").to_string())
+            }
+            None => (String::new(), String::new()),
+        };
+        let visible = match viewport {
+            Some((x0, y0, x1, y1)) => x >= x0 && x <= x1 && y >= y0 && y <= y1,
+            None => true,
+        };
+        let trimmed = f.cat_trim.get(row_kept).copied().unwrap_or(true);
+        let tag = f.cat_tag.get(row_kept).cloned().unwrap_or_default();
+        out.push(CatRow {
+            id: id.into(),
+            x: x as f32,
+            y: y as f32,
+            mag: mag.into(),
+            ra:  ra_s.into(),
+            dec: dec_s.into(),
+            visible: visible && trimmed,
+            tag: tag.into(),
+        });
         row_kept += 1;
     }
-    ModelRc::new(VecModel::from(out))
+    out
+}
+
+fn build_catalog_model(f: &Frame, viewport: Option<(f64, f64, f64, f64)>) -> ModelRc<CatRow> {
+    ModelRc::new(VecModel::from(build_catalog_rows(f, viewport)))
 }
 
 /// Find the catalog row (in the *kept* index space — matching what
@@ -795,6 +857,41 @@ fn nearest_catalog_index(cat: &Catalog, fx: f64, fy: f64, tol_px: f64) -> Option
         }
     }
     best.map(|(i, _)| i)
+}
+
+/// Compute the FITS-space bounding box of what the main canvas currently
+/// shows. Returns None when the window has no usable canvas size yet.
+fn current_visible_box(window: &MainWindow, f: &Frame) -> Option<(f64, f64, f64, f64)> {
+    let cw = window.get_canvas_w() as f64;
+    let ch = window.get_canvas_h() as f64;
+    if cw < 8.0 || ch < 8.0 { return None; }
+    // Display-space corners → FITS pixels (orientation-aware).
+    let (x0, y0) = display_to_fits(0.0, 0.0, f);
+    let (x1, y1) = display_to_fits(cw, ch, f);
+    let (xmin, xmax) = (x0.min(x1), x0.max(x1));
+    let (ymin, ymax) = (y0.min(y1), y0.max(y1));
+    Some((xmin, ymin, xmax, ymax))
+}
+
+/// Mirror the active frame's catalog into the standalone CatalogWindow (if
+/// alive). Called from refresh_view; safe to call when the window is hidden.
+fn push_catalog_to_window(st: &State, viewport: Option<(f64, f64, f64, f64)>) {
+    let Some(weak) = st.cat_window.as_ref() else { return };
+    let Some(cw) = weak.upgrade() else { return };
+    let Some(f) = st.active_frame() else {
+        cw.set_rows(ModelRc::new(VecModel::from(Vec::<CatRow>::new())));
+        cw.set_selected(-1);
+        cw.set_visible_count(0);
+        cw.set_source_name("—".into());
+        return;
+    };
+    let rows = build_catalog_rows(f, viewport);
+    let visible_count = rows.iter().filter(|r| r.visible).count() as i32;
+    cw.set_rows(ModelRc::new(VecModel::from(rows)));
+    cw.set_selected(f.selected_catalog.map(|i| i as i32).unwrap_or(-1));
+    cw.set_visible_count(visible_count);
+    cw.set_visible_filter(st.cat_visible_filter);
+    cw.set_source_name(f.name.clone().into());
 }
 
 /// Push current state-derived visuals (image, colorbar, markers, info badges) into the window.
@@ -819,8 +916,11 @@ fn refresh_view(window: &MainWindow, st: &State) {
         window.set_catalog_selected(-1);
         window.set_fits_width(0);
         window.set_fits_height(0);
+        push_catalog_to_window(st, None);
         return;
     };
+
+    let viewport = current_visible_box(window, f);
 
     window.set_active_stretch(f.stretch_label().into());
     window.set_active_limits(f.limits_label().into());
@@ -840,7 +940,7 @@ fn refresh_view(window: &MainWindow, st: &State) {
         window.set_view_pan_y(0.0);
         window.set_markers(ModelRc::new(VecModel::from(Vec::<Mark>::new())));
         window.set_text_marks(ModelRc::new(VecModel::from(Vec::<TextMark>::new())));
-        window.set_catalog_rows(build_catalog_model(f));
+        window.set_catalog_rows(build_catalog_model(f, viewport));
         window.set_catalog_selected(-1);
         window.set_info_filename(format!("[tile] {} frames", st.frames.len()).into());
         window.set_line_visible(false);
@@ -850,12 +950,13 @@ fn refresh_view(window: &MainWindow, st: &State) {
         window.set_lock_pan(st.lock_pan);
         window.set_lock_cmap(st.lock_cmap);
         window.set_lock_scale(st.lock_scale);
+        push_catalog_to_window(st, viewport);
         return;
     }
 
     window.set_markers(build_mark_model(f));
     window.set_text_marks(build_text_marks(f));
-    window.set_catalog_rows(build_catalog_model(f));
+    window.set_catalog_rows(build_catalog_model(f, viewport));
     window.set_catalog_selected(f.selected_catalog.map(|i| i as i32).unwrap_or(-1));
     window.set_fits_image(render_image(f));
     window.set_fits_width(f.fits.width as i32);
@@ -883,6 +984,8 @@ fn refresh_view(window: &MainWindow, st: &State) {
     window.set_lock_pan(st.lock_pan);
     window.set_lock_cmap(st.lock_cmap);
     window.set_lock_scale(st.lock_scale);
+
+    push_catalog_to_window(st, viewport);
 }
 
 /// 128-bin histogram of finite samples in [lo, hi], rendered as a log-scale
@@ -1475,6 +1578,7 @@ fn catalog_load(window: &MainWindow, st: &mut State) {
             ).into());
             f.catalog = Some(cat);
             f.selected_catalog = None;
+            f.sync_catalog_aux();
             refresh_view(window, st);
         }
         Err(e) => window.set_status_text(format!("catalog read error: {e}").into()),
@@ -1610,6 +1714,7 @@ FLAGS
             if let Some(f) = st.frames.get_mut(idx) {
                 f.catalog = Some(c);
                 f.selected_catalog = None;
+                f.sync_catalog_aux();
             }
             refresh_view(window, st);
             window.set_status_text(format!(
@@ -2042,6 +2147,7 @@ fn netcat_vizier(window: &MainWindow, st: &mut State) {
             if let Some(f) = st.active_frame_mut() {
                 f.catalog = Some(cat);
                 f.selected_catalog = None;
+                f.sync_catalog_aux();
             }
             refresh_view(window, st);
             window.set_netcat_status(format!("vizier: {n} rows from {src}").into());
@@ -2071,6 +2177,7 @@ fn netcat_ned(window: &MainWindow, st: &mut State) {
             if let Some(f) = st.active_frame_mut() {
                 f.catalog = Some(cat);
                 f.selected_catalog = None;
+                f.sync_catalog_aux();
             }
             refresh_view(window, st);
             window.set_netcat_status(format!("ned: {n} rows").into());
@@ -2087,8 +2194,375 @@ fn catalog_clear(window: &MainWindow, st: &mut State) {
     if let Some(f) = st.active_frame_mut() {
         f.catalog = None;
         f.selected_catalog = None;
+        f.cat_trim.clear();
+        f.cat_tag.clear();
     }
     window.set_status_text("catalog cleared".into());
+    refresh_view(window, st);
+}
+
+/// Push one circle marker per catalog (x, y) row, tagged "catalog" so
+/// `catalog_clear_marks` can find them later. Idempotent: removes prior
+/// catalog markers first.
+fn catalog_mark_all(window: &MainWindow, st: &mut State) {
+    let n_added: usize = {
+        let Some(f) = st.active_frame_mut() else {
+            window.set_status_text("mark-all: no active frame".into());
+            return;
+        };
+        f.markers.retain(|m| !m.tags.iter().any(|t| t == "catalog"));
+        let Some(cat) = f.catalog.as_ref() else {
+            window.set_status_text("mark-all: no catalog loaded".into());
+            return;
+        };
+        let r = (f.fits.width.min(f.fits.height) as f64 * 0.005).max(4.0);
+        let mut added = 0usize;
+        let xy: Vec<(f64, f64)> = cat.xy_iter().collect();
+        for (x, y) in xy {
+            let mut m = ds9_marker::Marker::circle(x, y, r);
+            m.color = [0xff, 0xc1, 0x07, 0xff]; // ACCENT_GOLD
+            m.width = 1.0;
+            m.tags.push("catalog".into());
+            f.markers.push(m);
+            added += 1;
+        }
+        added
+    };
+    window.set_status_text(format!("mark-all: added {n_added} catalog markers").into());
+    refresh_view(window, st);
+}
+
+/// Remove only catalog-derived markers (those tagged "catalog").
+fn catalog_clear_marks(window: &MainWindow, st: &mut State) {
+    let removed = {
+        let Some(f) = st.active_frame_mut() else {
+            window.set_status_text("clear-marks: no active frame".into());
+            return;
+        };
+        let before = f.markers.len();
+        f.markers.retain(|m| !m.tags.iter().any(|t| t == "catalog"));
+        before - f.markers.len()
+    };
+    window.set_status_text(format!("clear-marks: removed {removed} catalog markers").into());
+    refresh_view(window, st);
+}
+
+/// Write the active frame's catalog as a TSV file (header + tab-separated
+/// rows). Lets the user pick the destination path.
+fn catalog_export_tsv(window: &MainWindow, st: &State) {
+    let Some(f) = st.active_frame() else {
+        window.set_status_text("export-tsv: no active frame".into()); return;
+    };
+    let Some(cat) = f.catalog.as_ref() else {
+        window.set_status_text("export-tsv: no catalog loaded".into()); return;
+    };
+    let chosen: Option<PathBuf> = rfd::FileDialog::new()
+        .set_title("Export catalog as TSV")
+        .set_file_name("catalog.tsv")
+        .add_filter("TSV", &["tsv", "cat", "txt"])
+        .save_file();
+    let Some(p) = chosen else { return };
+    let mut buf = String::new();
+    buf.push_str(&cat.columns.join("\t"));
+    buf.push('\n');
+    for r in &cat.rows {
+        buf.push_str(&r.join("\t"));
+        buf.push('\n');
+    }
+    match std::fs::write(&p, buf) {
+        Ok(()) => window.set_status_text(format!(
+            "export-tsv: wrote {} rows → {}", cat.len(), p.display()
+        ).into()),
+        Err(e) => window.set_status_text(format!("export-tsv: {e}").into()),
+    }
+}
+
+/// Write a bash "reproduce" script that re-applies the active frame's
+/// display state via IPC. The script uses `nc -U` against the per-user
+/// socket, so it works as long as ds9-rust is running with IPC enabled.
+fn export_reproduce_script(window: &MainWindow, st: &State) {
+    let Some(f) = st.active_frame() else {
+        window.set_status_text("export-script: no active frame".into()); return;
+    };
+    let chosen: Option<PathBuf> = rfd::FileDialog::new()
+        .set_title("Export reproduce script")
+        .set_file_name("ds9rust-reproduce.sh")
+        .add_filter("Bash", &["sh"])
+        .save_file();
+    let Some(p) = chosen else { return };
+    let mut out = String::new();
+    out.push_str("#!/bin/bash\n");
+    out.push_str("# ds9-rust reproduce script — re-applies the active frame's display\n");
+    out.push_str("# state by sending IPC commands to the running ds9-rust instance.\n");
+    out.push_str("set -e\n");
+    out.push_str("SOCK=\"${XDG_RUNTIME_DIR:-/tmp}/ds9-rust-${USER}.sock\"\n");
+    out.push_str("send() { printf '%s\\n' \"$*\" | nc -U \"$SOCK\" -q1 2>/dev/null || true; }\n");
+    out.push('\n');
+    if let Some(src) = &f.source_path {
+        out.push_str(&format!("send 'file open {}'\n", src.display()));
+    }
+    out.push_str(&format!("send 'cmap {}'\n", f.cmap.name()));
+    out.push_str(&format!("send 'scale {}'\n", f.stretch_label()));
+    out.push_str(&format!("send 'zoom {:.4}'\n", f.view_zoom));
+    if let LimitsMode::User { low, high } = f.limits_mode {
+        out.push_str(&format!("send 'scale limits {low} {high}'\n"));
+    }
+    if f.smooth_sigma > 0.0 {
+        out.push_str(&format!("send 'smooth {:.2}'\n", f.smooth_sigma));
+    }
+    if !f.markers.is_empty() {
+        out.push_str("# (regions are not exported here — use Region ▸ Save…)\n");
+    }
+    if f.catalog.is_some() {
+        out.push_str("# (catalog rows are not exported here — use Catalog ▸ Export TSV…)\n");
+    }
+    match std::fs::write(&p, out) {
+        Ok(()) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    &p, std::fs::Permissions::from_mode(0o755)
+                );
+            }
+            window.set_status_text(format!("export-script: wrote {}", p.display()).into());
+        }
+        Err(e) => window.set_status_text(format!("export-script: {e}").into()),
+    }
+}
+
+/// Read a bash reproduce script (or any text file) and replay every line
+/// of the form `send 'VERB ARGS'` (or `send "VERB ARGS"`) by dispatching
+/// the verb through `dispatch_ipc`. Other shell lines are ignored.
+fn import_reproduce_script(window: &MainWindow, st: &mut State) {
+    let chosen: Option<PathBuf> = rfd::FileDialog::new()
+        .set_title("Import reproduce script")
+        .add_filter("Bash", &["sh"])
+        .add_filter("All", &["*"])
+        .pick_file();
+    let Some(p) = chosen else { return };
+    let body = match std::fs::read_to_string(&p) {
+        Ok(b) => b,
+        Err(e) => { window.set_status_text(format!("import-script: {e}").into()); return; }
+    };
+    let mut n = 0usize;
+    for raw in body.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') { continue; }
+        let Some(rest) = line.strip_prefix("send ") else { continue };
+        let cmd = rest.trim()
+            .trim_matches(|c: char| c == '\'' || c == '"')
+            .to_string();
+        let _ = dispatch_ipc(window, st, &cmd);
+        n += 1;
+    }
+    window.set_status_text(format!(
+        "import-script: replayed {n} commands from {}", p.display()
+    ).into());
+    refresh_view(window, st);
+}
+
+/// Run a SEP-based Python source detector on the active frame's FITS file
+/// and load the resulting catalog. Spawns `python3` (or `python`) and runs
+/// an inline helper using the `sep` and `astropy` packages.
+fn run_sep_python(window: &MainWindow, st: &mut State) {
+    let (idx, fits_path, name) = {
+        let Some(f) = st.active_frame() else {
+            window.set_status_text("sep: no active frame".into()); return;
+        };
+        let Some(p) = f.source_path.clone() else {
+            window.set_status_text(
+                "sep: active frame has no on-disk path (RGB / synthetic)".into()
+            );
+            return;
+        };
+        (st.active, p, f.name.clone())
+    };
+    let py: Option<String> = ["python3", "python"].iter().find_map(|n| {
+        std::process::Command::new(n)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .ok()
+            .map(|_| n.to_string())
+    });
+    let Some(py) = py else {
+        window.set_status_text("sep: no python3 / python on PATH".into());
+        return;
+    };
+    let tmp = std::env::temp_dir()
+        .join(format!("ds9-rust-sep-{}-{}", std::process::id(), idx));
+    if let Err(e) = std::fs::create_dir_all(&tmp) {
+        window.set_status_text(format!("sep: tmpdir: {e}").into()); return;
+    }
+    let cat = tmp.join("out.tsv");
+    let helper = tmp.join("ds9rust_sep.py");
+    // Inline Python sidecar: SEP background + extract, write TSV with
+    // SExtractor-compatible column names so `xy_columns()` finds them.
+    let helper_src = r#"
+import sys, numpy as np, sep
+from astropy.io import fits
+
+src, dst = sys.argv[1], sys.argv[2]
+hdul = fits.open(src, memmap=True)
+data = None
+for h in hdul:
+    if h.data is not None and getattr(h.data, "ndim", 0) >= 2:
+        d = h.data
+        if d.ndim > 2: d = d[(0,) * (d.ndim - 2)]
+        data = np.ascontiguousarray(d.astype(np.float32))
+        break
+if data is None:
+    sys.stderr.write("no image HDU\n"); sys.exit(2)
+data = data.byteswap().newbyteorder() if data.dtype.byteorder not in ("=", "|") else data
+bkg = sep.Background(data)
+data_sub = data - bkg.back()
+thresh = 1.5 * bkg.globalrms
+objs = sep.extract(data_sub, thresh, minarea=5, deblend_nthresh=32, deblend_cont=0.005, clean=True)
+flux, _, _ = sep.sum_circle(data_sub, objs['x'], objs['y'], 5.0, err=bkg.globalrms)
+with open(dst, "w") as fh:
+    fh.write("NUMBER\tX_IMAGE\tY_IMAGE\tMAG_AUTO\tA_IMAGE\tB_IMAGE\tTHETA_IMAGE\tFLAGS\n")
+    for i, o in enumerate(objs, 1):
+        fl = float(flux[i-1])
+        mag = -2.5 * np.log10(fl) if fl > 0 else 99.0
+        fh.write(f"{i}\t{o['x']+1:.3f}\t{o['y']+1:.3f}\t{mag:.3f}\t{o['a']:.3f}\t{o['b']:.3f}\t{np.degrees(o['theta']):.2f}\t{int(o['flag'])}\n")
+sys.stderr.write(f"sep: extracted {len(objs)} sources\n")
+"#;
+    if let Err(e) = std::fs::write(&helper, helper_src) {
+        window.set_status_text(format!("sep: write helper: {e}").into()); return;
+    }
+
+    window.set_status_text(format!("sep: running on {name}…").into());
+    let output = std::process::Command::new(&py)
+        .arg(&helper)
+        .arg(&fits_path)
+        .arg(&cat)
+        .output();
+    let output = match output {
+        Ok(o) => o,
+        Err(e) => { window.set_status_text(format!("sep: spawn: {e}").into()); return; }
+    };
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let last = stderr.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("");
+        window.set_status_text(format!("sep failed: {last}").into());
+        return;
+    }
+    match Catalog::from_path(&cat) {
+        Ok(c) => {
+            let n = c.len();
+            if let Some(f) = st.frames.get_mut(idx) {
+                f.catalog = Some(c);
+                f.selected_catalog = None;
+                f.sync_catalog_aux();
+            }
+            refresh_view(window, st);
+            window.set_status_text(format!(
+                "sep: detected {n} sources from {name}"
+            ).into());
+        }
+        Err(e) => window.set_status_text(format!("sep: read catalog: {e}").into()),
+    }
+}
+
+/// Apply a textual trim expression to the active frame's `cat_trim`. Supports
+/// simple `<column> <op> <value>` clauses chained with `and` / `or`.
+/// Empty expression resets the trim mask.
+fn apply_trim_expression(window: &MainWindow, st: &mut State, expr: &str) {
+    let Some(f) = st.active_frame_mut() else {
+        window.set_status_text("trim: no active frame".into()); return;
+    };
+    let Some(cat) = f.catalog.as_ref() else {
+        window.set_status_text("trim: no catalog loaded".into()); return;
+    };
+    let n = cat.len();
+    f.cat_trim.resize(n, true);
+    let expr = expr.trim();
+    if expr.is_empty() {
+        for v in f.cat_trim.iter_mut() { *v = true; }
+        window.set_status_text("trim: cleared".into());
+        refresh_view(window, st);
+        return;
+    }
+    // Parse `(clause)( and|or clause)*` where clause = `name op value`.
+    enum Op { Lt, Le, Gt, Ge, Eq, Ne }
+    enum Logic { And, Or }
+    struct Clause { col: usize, op: Op, val: f64 }
+    let lower = expr.to_ascii_lowercase();
+    let tokens: Vec<&str> = lower.split_whitespace().collect();
+    let mut clauses: Vec<Clause> = Vec::new();
+    let mut logics: Vec<Logic> = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        if i + 2 >= tokens.len() { break; }
+        let name = tokens[i];
+        let op_str = tokens[i + 1];
+        let val_str = tokens[i + 2];
+        let op = match op_str {
+            "<"  => Op::Lt, "<=" => Op::Le,
+            ">"  => Op::Gt, ">=" => Op::Ge,
+            "="  | "==" => Op::Eq,
+            "!=" | "<>" => Op::Ne,
+            _ => break,
+        };
+        let val: f64 = match val_str.parse() { Ok(v) => v, Err(_) => break };
+        let col = cat.columns.iter().position(|c| c.eq_ignore_ascii_case(name));
+        let Some(col) = col else {
+            window.set_status_text(format!("trim: unknown column '{name}'").into());
+            return;
+        };
+        clauses.push(Clause { col, op, val });
+        i += 3;
+        if i < tokens.len() {
+            match tokens[i] {
+                "and" => { logics.push(Logic::And); i += 1; }
+                "or"  => { logics.push(Logic::Or);  i += 1; }
+                _ => break,
+            }
+        }
+    }
+    if clauses.is_empty() {
+        window.set_status_text("trim: parse error (use 'col < val [and col > val …]')".into());
+        return;
+    }
+    // Evaluate per row in catalog (kept-index space matches catalog row order
+    // since build_catalog_model walks in the same order).
+    let mut kept = 0usize;
+    for row in cat.rows.iter() {
+        let mut acc = match clauses[0].op {
+            Op::Lt => row.get(clauses[0].col).and_then(|s| s.trim().parse::<f64>().ok()).map(|v| v <  clauses[0].val).unwrap_or(false),
+            Op::Le => row.get(clauses[0].col).and_then(|s| s.trim().parse::<f64>().ok()).map(|v| v <= clauses[0].val).unwrap_or(false),
+            Op::Gt => row.get(clauses[0].col).and_then(|s| s.trim().parse::<f64>().ok()).map(|v| v >  clauses[0].val).unwrap_or(false),
+            Op::Ge => row.get(clauses[0].col).and_then(|s| s.trim().parse::<f64>().ok()).map(|v| v >= clauses[0].val).unwrap_or(false),
+            Op::Eq => row.get(clauses[0].col).and_then(|s| s.trim().parse::<f64>().ok()).map(|v| (v - clauses[0].val).abs() < 1e-9).unwrap_or(false),
+            Op::Ne => row.get(clauses[0].col).and_then(|s| s.trim().parse::<f64>().ok()).map(|v| (v - clauses[0].val).abs() >= 1e-9).unwrap_or(false),
+        };
+        for (cl, lg) in clauses.iter().skip(1).zip(logics.iter()) {
+            let r = match cl.op {
+                Op::Lt => row.get(cl.col).and_then(|s| s.trim().parse::<f64>().ok()).map(|v| v <  cl.val).unwrap_or(false),
+                Op::Le => row.get(cl.col).and_then(|s| s.trim().parse::<f64>().ok()).map(|v| v <= cl.val).unwrap_or(false),
+                Op::Gt => row.get(cl.col).and_then(|s| s.trim().parse::<f64>().ok()).map(|v| v >  cl.val).unwrap_or(false),
+                Op::Ge => row.get(cl.col).and_then(|s| s.trim().parse::<f64>().ok()).map(|v| v >= cl.val).unwrap_or(false),
+                Op::Eq => row.get(cl.col).and_then(|s| s.trim().parse::<f64>().ok()).map(|v| (v - cl.val).abs() < 1e-9).unwrap_or(false),
+                Op::Ne => row.get(cl.col).and_then(|s| s.trim().parse::<f64>().ok()).map(|v| (v - cl.val).abs() >= 1e-9).unwrap_or(false),
+            };
+            acc = match lg { Logic::And => acc && r, Logic::Or => acc || r };
+        }
+        // Only count rows that build_catalog_model would keep (must have x,y).
+        let xy_ok = cat.xy_columns().map(|(xi, yi)| {
+            row.get(xi).and_then(|s| s.parse::<f64>().ok()).is_some() &&
+            row.get(yi).and_then(|s| s.parse::<f64>().ok()).is_some()
+        }).unwrap_or(false);
+        if xy_ok {
+            if kept < f.cat_trim.len() { f.cat_trim[kept] = acc; }
+            kept += 1;
+        }
+    }
+    let pass = f.cat_trim.iter().take(kept).filter(|b| **b).count();
+    window.set_status_text(format!(
+        "trim: {pass}/{kept} rows pass '{}'", expr
+    ).into());
     refresh_view(window, st);
 }
 
@@ -3220,6 +3694,8 @@ fn handle_menu(window: &MainWindow, st: &mut State, menu: &str, item: &str) {
         }
         ("File", "SAMP Send Image")    => samp_send_active_image(window, st),
         ("File", "SAMP Send VOTable…") => samp_send_votable(window),
+        ("File", "Export Reproduce Script…") => export_reproduce_script(window, st),
+        ("File", "Import Reproduce Script…") => import_reproduce_script(window, st),
         ("File", "Quit")  => { let _ = slint::quit_event_loop(); }
 
         // View — sidebar panel toggles and overlays
@@ -3664,6 +4140,7 @@ fn handle_menu(window: &MainWindow, st: &mut State, menu: &str, item: &str) {
         ("Catalog", "Load…") => { catalog_load(window, st); }
         ("Catalog", "Clear") => { catalog_clear(window, st); }
         ("Catalog", "Run SExtractor…") => { run_sextractor(window, st); }
+        ("Catalog", "Run SEP…") => { run_sep_python(window, st); }
         ("Catalog", "Online Query…") => {
             window.set_netcat_visible(!window.get_netcat_visible());
             window.set_status_text(
@@ -3671,6 +4148,22 @@ fn handle_menu(window: &MainWindow, st: &mut State, menu: &str, item: &str) {
                 else                            { "online catalog query: hidden".into() }
             );
         }
+        ("Catalog", "Show Catalog Window") => {
+            if let Some(weak) = st.cat_window.as_ref() {
+                if let Some(cw) = weak.upgrade() {
+                    let _ = cw.show();
+                    let viewport = st.active_frame()
+                        .and_then(|f| current_visible_box(window, f));
+                    push_catalog_to_window(st, viewport);
+                    window.set_status_text("catalog window: shown".into());
+                    return;
+                }
+            }
+            window.set_status_text("catalog window: not initialized".into());
+        }
+        ("Catalog", "Mark All") => { catalog_mark_all(window, st); }
+        ("Catalog", "Clear Marks") => { catalog_clear_marks(window, st); }
+        ("Catalog", "Export TSV…") => { catalog_export_tsv(window, st); }
         ("Catalog", "Info")  => {
             let msg = match st.active_frame().and_then(|f| f.catalog.as_ref()) {
                 Some(c) => format!(
@@ -4306,10 +4799,12 @@ thread_local! {
 fn main() -> Result<()> {
     let argv: Vec<String> = env::args().collect();
     let win = MainWindow::new()?;
+    let cat_win = CatalogWindow::new()?;
     let state = Rc::new(RefCell::new(State::new()));
     // Pull persisted preferences (if any) before loading the first file so
     // those defaults stick to every frame in this session.
     state.borrow_mut().prefs = load_prefs_from_disk();
+    state.borrow_mut().cat_window = Some(cat_win.as_weak());
 
     refresh_view(&win, &state.borrow());
 
@@ -4332,6 +4827,7 @@ fn main() -> Result<()> {
             let n = cat.len();
             if let Some(f) = state.borrow_mut().active_frame_mut() {
                 f.catalog = Some(cat);
+                f.sync_catalog_aux();
             }
             refresh_view(&win, &state.borrow());
             win.set_status_text(format!("loaded catalog ({n} rows) from {p}").into());
@@ -4393,14 +4889,23 @@ fn main() -> Result<()> {
                 }
             }
 
-            let st = state.borrow();
-            let Some(f) = st.active_frame() else {
-                w.set_info_coords("x: ——      y: ——".into());
-                w.set_info_value("value: ——".into());
-                w.set_info_wcs("wcs: ——".into());
-                return;
+            let (fits_x, fits_y) = {
+                let mut s = state.borrow_mut();
+                let xy = match s.active_frame() {
+                    Some(f) => display_to_fits(x as f64, y as f64, f),
+                    None => {
+                        s.last_hover_fits = None;
+                        w.set_info_coords("x: ——      y: ——".into());
+                        w.set_info_value("value: ——".into());
+                        w.set_info_wcs("wcs: ——".into());
+                        return;
+                    }
+                };
+                s.last_hover_fits = Some(xy);
+                xy
             };
-            let (fits_x, fits_y) = display_to_fits(x as f64, y as f64, f);
+            let st = state.borrow();
+            let Some(f) = st.active_frame() else { return };
             w.set_info_coords(format!("x: {:>7.1}    y: {:>7.1}", fits_x, fits_y).into());
 
             let ux = (fits_x - 1.0).round() as i32;
@@ -4522,6 +5027,124 @@ fn main() -> Result<()> {
         });
     }
 
+    // ---- main view pan/zoom changed → push viewport to catalog window so
+    //      the Visible-Filter / "in-view" highlight stays accurate ----
+    {
+        let weak = win.as_weak();
+        let state = Rc::clone(&state);
+        win.on_view_changed(move || {
+            let Some(w) = weak.upgrade() else { return };
+            if state.try_borrow_mut().is_err() { return; }
+            let s = state.borrow();
+            let viewport = s.active_frame().and_then(|f| current_visible_box(&w, f));
+            push_catalog_to_window(&s, viewport);
+        });
+    }
+
+    // ---- standalone CatalogWindow callbacks ----
+    {
+        let main_weak = win.as_weak();
+        let cat_weak = cat_win.as_weak();
+        let state = Rc::clone(&state);
+        cat_win.on_row_activated(move |idx| {
+            let Some(mw) = main_weak.upgrade() else { return };
+            let _ = cat_weak.upgrade();
+            if state.try_borrow_mut().is_err() { return; }
+            let idx = idx as usize;
+            let mut s = state.borrow_mut();
+            let xy = s.active_frame()
+                .and_then(|f| f.catalog.as_ref())
+                .and_then(|c| c.xy_iter().nth(idx));
+            if let Some((x, y)) = xy {
+                if let Some(f) = s.active_frame_mut() { f.selected_catalog = Some(idx); }
+                refresh_view(&mw, &s);
+                if let Some(f) = s.active_frame() {
+                    let (display_x, display_y) = fits_to_display_oriented(x, y, f);
+                    mw.invoke_recenter_view_on(display_x, display_y);
+                }
+                mw.set_status_text(
+                    format!("catwin: row {} @ ({:.1}, {:.1})", idx + 1, x, y).into(),
+                );
+            }
+        });
+    }
+    {
+        let main_weak = win.as_weak();
+        let state = Rc::clone(&state);
+        cat_win.on_mark_all(move || {
+            let Some(mw) = main_weak.upgrade() else { return };
+            if state.try_borrow_mut().is_err() { return; }
+            catalog_mark_all(&mw, &mut state.borrow_mut());
+        });
+    }
+    {
+        let main_weak = win.as_weak();
+        let state = Rc::clone(&state);
+        cat_win.on_clear_marks(move || {
+            let Some(mw) = main_weak.upgrade() else { return };
+            if state.try_borrow_mut().is_err() { return; }
+            catalog_clear_marks(&mw, &mut state.borrow_mut());
+        });
+    }
+    {
+        let main_weak = win.as_weak();
+        let state = Rc::clone(&state);
+        cat_win.on_visible_filter_changed(move |on| {
+            let Some(mw) = main_weak.upgrade() else { return };
+            if state.try_borrow_mut().is_err() { return; }
+            let mut s = state.borrow_mut();
+            s.cat_visible_filter = on;
+            mw.set_status_text(
+                format!("catalog visible-filter: {}", if on { "on" } else { "off" }).into()
+            );
+            refresh_view(&mw, &s);
+        });
+    }
+    {
+        let main_weak = win.as_weak();
+        let state = Rc::clone(&state);
+        cat_win.on_trim_applied(move |expr| {
+            let Some(mw) = main_weak.upgrade() else { return };
+            if state.try_borrow_mut().is_err() { return; }
+            apply_trim_expression(&mw, &mut state.borrow_mut(), expr.as_str());
+        });
+    }
+    {
+        let main_weak = win.as_weak();
+        let state = Rc::clone(&state);
+        cat_win.on_run_sep_clicked(move || {
+            let Some(mw) = main_weak.upgrade() else { return };
+            if state.try_borrow_mut().is_err() { return; }
+            run_sep_python(&mw, &mut state.borrow_mut());
+        });
+    }
+    {
+        let main_weak = win.as_weak();
+        let state = Rc::clone(&state);
+        cat_win.on_export_tsv_clicked(move || {
+            let Some(mw) = main_weak.upgrade() else { return };
+            if state.try_borrow_mut().is_err() { return; }
+            catalog_export_tsv(&mw, &state.borrow());
+        });
+    }
+    {
+        let cat_weak = cat_win.as_weak();
+        cat_win.on_close_requested(move || {
+            if let Some(cw) = cat_weak.upgrade() {
+                let _ = cw.hide();
+            }
+        });
+    }
+    {
+        let main_weak = win.as_weak();
+        let state = Rc::clone(&state);
+        cat_win.on_tag_filter_changed(move |s_in| {
+            let Some(mw) = main_weak.upgrade() else { return };
+            if state.try_borrow_mut().is_err() { return; }
+            mw.set_status_text(format!("catalog tag filter: '{s_in}' (not yet wired)").into());
+        });
+    }
+
     // ---- canvas pointer-down: select / start drag ----
     {
         let weak = win.as_weak();
@@ -4582,6 +5205,107 @@ fn main() -> Result<()> {
             let Some(w) = weak.upgrade() else { return };
             w.set_active_mode(mode.clone());
             w.set_status_text(format!("mode: {mode}").into());
+        });
+    }
+
+    // ---- single-key shortcuts (A/D/S) — applied at last hover position ----
+    {
+        let weak = win.as_weak();
+        let state = Rc::clone(&state);
+        win.on_key_shortcut(move |key| {
+            let Some(w) = weak.upgrade() else { return };
+            if state.try_borrow_mut().is_err() { return; }
+            // Slint sends e.text as a string; Latin letters arrive in their
+            // platform-native case. Match case-insensitively.
+            let k = key.to_ascii_lowercase();
+            let k = k.as_str();
+            match k {
+                "a" | "d" | "s" => {
+                    let mut s = state.borrow_mut();
+                    let Some((fx, fy)) = s.last_hover_fits else {
+                        w.set_status_text(format!("[{k}] no cursor position yet").into());
+                        return;
+                    };
+                    // Build a synthetic catalog if none yet (so 'a' can seed one).
+                    let need_seed = s.active_frame().map(|f| f.catalog.is_none()).unwrap_or(false);
+                    if need_seed && k == "a" {
+                        if let Some(f) = s.active_frame_mut() {
+                            f.catalog = Some(Catalog {
+                                columns: vec!["NUMBER".into(), "X_IMAGE".into(),
+                                              "Y_IMAGE".into(), "MAG_AUTO".into(), "TAG".into()],
+                                rows: Vec::new(),
+                            });
+                            f.sync_catalog_aux();
+                        }
+                    }
+                    let Some(f) = s.active_frame_mut() else { return };
+                    let Some(cat) = f.catalog.as_mut() else {
+                        drop(s);
+                        w.set_status_text(format!("[{k}] no catalog loaded").into());
+                        return;
+                    };
+                    let xy_cols = cat.xy_columns();
+                    let Some((xi, yi)) = xy_cols else {
+                        drop(s);
+                        w.set_status_text(format!("[{k}] catalog has no X/Y columns").into());
+                        return;
+                    };
+                    match k {
+                        "a" => {
+                            // Append a new row at hover position. Tag = "A".
+                            let mut row = vec![String::new(); cat.columns.len().max(xi.max(yi) + 1)];
+                            // NUMBER (or first col): use len+1
+                            if let Some(slot) = row.get_mut(0) {
+                                *slot = (cat.rows.len() + 1).to_string();
+                            }
+                            row[xi] = format!("{fx:.3}");
+                            row[yi] = format!("{fy:.3}");
+                            // tag column (TAG) if present
+                            if let Some(ti) = cat.col_index("TAG") {
+                                if ti < row.len() { row[ti] = "A".into(); }
+                            }
+                            cat.rows.push(row);
+                            f.sync_catalog_aux();
+                            // also tag the kept-index slot
+                            let kept_idx = f.cat_tag.len().saturating_sub(1);
+                            if kept_idx < f.cat_tag.len() {
+                                f.cat_tag[kept_idx] = "A".into();
+                            }
+                            f.selected_catalog = Some(kept_idx);
+                            w.set_status_text(format!(
+                                "[a] added catalog row #{} @ ({:.1},{:.1})",
+                                kept_idx + 1, fx, fy
+                            ).into());
+                        }
+                        "d" | "s" => {
+                            // Find nearest row to hover; tag it (D = delete-flag, S = separate-flag).
+                            let tol = (f.fits.width.min(f.fits.height) as f64 * 0.01).max(8.0);
+                            let nearest = nearest_catalog_index(cat, fx, fy, tol);
+                            let Some(idx) = nearest else {
+                                drop(s);
+                                w.set_status_text(format!("[{k}] no catalog row near cursor").into());
+                                return;
+                            };
+                            f.sync_catalog_aux();
+                            if idx < f.cat_tag.len() {
+                                f.cat_tag[idx] = match k { "d" => "D".into(), _ => "S".into() };
+                            }
+                            f.selected_catalog = Some(idx);
+                            w.set_status_text(format!(
+                                "[{k}] tagged catalog row #{} @ ({:.1},{:.1})",
+                                idx + 1, fx, fy
+                            ).into());
+                        }
+                        _ => {}
+                    }
+                    refresh_view(&w, &s);
+                }
+                "m" => {
+                    // OGFinder-style: M = mark-all toggle (refresh markers).
+                    catalog_mark_all(&w, &mut state.borrow_mut());
+                }
+                _ => {} // ignore everything else
+            }
         });
     }
 

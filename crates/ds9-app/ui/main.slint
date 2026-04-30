@@ -19,11 +19,18 @@ struct Mark {
 
 // One row of the catalog table panel. `id` is a short label (NUMBER or row
 // index), `mag` is preformatted ("—" if no magnitude column was found).
+// `visible` is the result of the Visible-Filter / Trim filter — false rows
+// are skipped during rendering and Mark All. `tag` is a short OGFinder-style
+// classification ("" / "M" merged / "S" split / "A" added / "F" flagged).
 struct CatRow {
     id: string,
     x: float,         // FITS image-pixel coords (1-based)
     y: float,
     mag: string,
+    ra:  string,      // pre-formatted sexagesimal or "" if no WCS
+    dec: string,
+    visible: bool,
+    tag: string,
 }
 
 // Floating text annotation (DS9 `text(x,y)` regions). Coords are in display
@@ -446,6 +453,259 @@ component CatalogPanel inherits Rectangle {
     }
 }
 
+/// OGFinder-style standalone Catalog window. Larger table (id, x, y, ra, dec,
+/// mag, tag), toolbar (Mark All, Visible filter, Trim, Run SEP, Export),
+/// status bar. Bidirectionally synced with the main canvas via shared State.
+export component CatalogWindow inherits Window {
+    title: "ds9-rust — Catalog";
+    background: Style.bg-deep;
+    preferred-width:  720px;
+    preferred-height: 540px;
+    min-width:  480px;
+    min-height: 320px;
+
+    in-out property <[CatRow]> rows: [];
+    in-out property <int>      selected: -1;
+    in-out property <string>   source-name: "—";
+    in-out property <bool>     visible-filter: false;
+    in-out property <int>      visible-count: 0;
+    in-out property <string>   trim-expression: "";
+    in-out property <string>   tag-filter: "";
+
+    callback row-activated(/*index*/ int);
+    callback mark-all();
+    callback clear-marks();
+    callback visible-filter-changed(bool);
+    callback trim-applied(string);
+    callback tag-filter-changed(string);
+    callback run-sep-clicked();
+    callback export-tsv-clicked();
+    callback close-requested();
+
+    property <length> row-h: 18px;
+
+    VerticalLayout {
+        spacing: 0px;
+
+        // ----- toolbar -----
+        Rectangle {
+            background: Style.bg-panel;
+            border-color: Style.border;
+            border-width: 1px;
+            height: 36px;
+            HorizontalLayout {
+                padding: 4px;
+                spacing: 4px;
+                alignment: start;
+                Button {
+                    text: "Mark All";
+                    clicked => { root.mark-all(); }
+                }
+                Button {
+                    text: "Clear Marks";
+                    clicked => { root.clear-marks(); }
+                }
+                Rectangle { width: 6px; }
+                Text {
+                    text: "Visible Filter";
+                    color: Style.text-dim;
+                    font-size: 11px;
+                    font-family: Style.mono;
+                    vertical-alignment: center;
+                }
+                vf := Rectangle {
+                    width: 22px; height: 22px;
+                    background: root.visible-filter ? Style.accent-dim : Style.bg-sunken;
+                    border-color: Style.border;
+                    border-width: 1px;
+                    border-radius: 3px;
+                    Text {
+                        text: root.visible-filter ? "✓" : "";
+                        color: Style.text;
+                        font-size: 13px;
+                        font-family: Style.mono;
+                        x: (parent.width - self.width) / 2;
+                        y: (parent.height - self.height) / 2;
+                    }
+                    TouchArea {
+                        clicked => {
+                            root.visible-filter = !root.visible-filter;
+                            root.visible-filter-changed(root.visible-filter);
+                        }
+                    }
+                }
+                Rectangle { width: 6px; }
+                Button {
+                    text: "Trim…";
+                    clicked => { root.trim-applied(root.trim-expression); }
+                }
+                Rectangle { horizontal-stretch: 1; }
+                Button {
+                    text: "Run SEP…";
+                    clicked => { root.run-sep-clicked(); }
+                }
+                Button {
+                    text: "Export TSV…";
+                    clicked => { root.export-tsv-clicked(); }
+                }
+            }
+        }
+
+        // ----- filter row -----
+        Rectangle {
+            background: Style.bg-sunken;
+            border-color: Style.border;
+            border-width: 1px;
+            height: 32px;
+            HorizontalLayout {
+                padding: 4px;
+                spacing: 4px;
+                Text {
+                    text: "Trim:";
+                    color: Style.text-dim;
+                    font-size: 11px;
+                    font-family: Style.mono;
+                    vertical-alignment: center;
+                }
+                LineEdit {
+                    text: root.trim-expression;
+                    placeholder-text: "mag<22 and a<3";
+                    horizontal-stretch: 3;
+                    edited(t) => { root.trim-expression = t; }
+                    accepted(t) => { root.trim-applied(t); }
+                }
+                Text {
+                    text: "Tag:";
+                    color: Style.text-dim;
+                    font-size: 11px;
+                    font-family: Style.mono;
+                    vertical-alignment: center;
+                }
+                LineEdit {
+                    text: root.tag-filter;
+                    placeholder-text: "M, S, A, F, …";
+                    horizontal-stretch: 1;
+                    edited(t) => { root.tag-filter = t; root.tag-filter-changed(t); }
+                }
+            }
+        }
+
+        // ----- column header -----
+        Rectangle {
+            height: 18px;
+            background: Style.bg-panel;
+            border-color: Style.border;
+            border-width: 1px;
+            HorizontalLayout {
+                padding-left: 6px; padding-right: 6px;
+                Text { text: "id";   color: Style.text-dim; font-size: 10px; font-family: Style.mono;
+                       horizontal-stretch: 1; vertical-alignment: center; }
+                Text { text: "x";    color: Style.text-dim; font-size: 10px; font-family: Style.mono;
+                       horizontal-stretch: 1; vertical-alignment: center; horizontal-alignment: right; }
+                Text { text: "y";    color: Style.text-dim; font-size: 10px; font-family: Style.mono;
+                       horizontal-stretch: 1; vertical-alignment: center; horizontal-alignment: right; }
+                Text { text: "ra";   color: Style.text-dim; font-size: 10px; font-family: Style.mono;
+                       horizontal-stretch: 2; vertical-alignment: center; horizontal-alignment: right; }
+                Text { text: "dec";  color: Style.text-dim; font-size: 10px; font-family: Style.mono;
+                       horizontal-stretch: 2; vertical-alignment: center; horizontal-alignment: right; }
+                Text { text: "mag";  color: Style.text-dim; font-size: 10px; font-family: Style.mono;
+                       horizontal-stretch: 1; vertical-alignment: center; horizontal-alignment: right; }
+                Text { text: "tag";  color: Style.text-dim; font-size: 10px; font-family: Style.mono;
+                       horizontal-stretch: 1; vertical-alignment: center; horizontal-alignment: right; }
+            }
+        }
+
+        // ----- table body -----
+        Rectangle {
+            vertical-stretch: 1;
+            background: Style.bg-sunken;
+            border-color: Style.border;
+            border-width: 1px;
+
+            sv2 := ScrollView {
+                changed viewport-y => { /* needed so we can write viewport-y */ }
+                VerticalLayout {
+                    spacing: 0px;
+                    for r[i] in root.rows: Rectangle {
+                        // Visible-Filter mode: dim out rows that are off-screen
+                        // in the main canvas instead of removing them, so the
+                        // selection index stays stable.
+                        height: (root.visible-filter && !r.visible) ? 0px : root.row-h;
+                        background: i == root.selected
+                            ? Style.accent-dim
+                            : (rta.has-hover ? Style.bg-hover : (mod(i, 2) == 0 ? transparent : Style.bg-panel));
+                        HorizontalLayout {
+                            padding-left: 6px; padding-right: 6px;
+                            Text { text: r.id; color: Style.text; font-size: 11px; font-family: Style.mono;
+                                   horizontal-stretch: 1; vertical-alignment: center; }
+                            Text { text: round(r.x * 10) / 10; color: Style.text-dim;
+                                   font-size: 11px; font-family: Style.mono;
+                                   horizontal-stretch: 1; vertical-alignment: center; horizontal-alignment: right; }
+                            Text { text: round(r.y * 10) / 10; color: Style.text-dim;
+                                   font-size: 11px; font-family: Style.mono;
+                                   horizontal-stretch: 1; vertical-alignment: center; horizontal-alignment: right; }
+                            Text { text: r.ra;  color: Style.text-dim;
+                                   font-size: 11px; font-family: Style.mono;
+                                   horizontal-stretch: 2; vertical-alignment: center; horizontal-alignment: right; }
+                            Text { text: r.dec; color: Style.text-dim;
+                                   font-size: 11px; font-family: Style.mono;
+                                   horizontal-stretch: 2; vertical-alignment: center; horizontal-alignment: right; }
+                            Text { text: r.mag; color: Style.text-dim;
+                                   font-size: 11px; font-family: Style.mono;
+                                   horizontal-stretch: 1; vertical-alignment: center; horizontal-alignment: right; }
+                            Text { text: r.tag; color: Style.accent;
+                                   font-size: 11px; font-family: Style.mono;
+                                   horizontal-stretch: 1; vertical-alignment: center; horizontal-alignment: right; }
+                        }
+                        rta := TouchArea {
+                            clicked => { root.row-activated(i); }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ----- status bar -----
+        Rectangle {
+            background: Style.bg-panel;
+            border-color: Style.border;
+            border-width: 1px;
+            height: 22px;
+            HorizontalLayout {
+                padding-left: 8px; padding-right: 8px;
+                Text {
+                    text: "src: " + root.source-name;
+                    color: Style.text-dim;
+                    font-size: 10px;
+                    font-family: Style.mono;
+                    horizontal-stretch: 2;
+                    vertical-alignment: center;
+                }
+                Text {
+                    text: root.visible-filter
+                        ? (root.visible-count + " / " + root.rows.length + " visible")
+                        : (root.rows.length + " rows");
+                    color: Style.accent;
+                    font-size: 10px;
+                    font-family: Style.mono;
+                    vertical-alignment: center;
+                    horizontal-alignment: right;
+                    horizontal-stretch: 1;
+                }
+            }
+        }
+    }
+
+    // auto-scroll selection into view when changed externally
+    changed selected => {
+        if (root.selected >= 0) {
+            // best-effort centring; works because every visible row has the same height
+            // (rows hidden by visible-filter take 0px so the math is approximate)
+            sv2.viewport-y = -1px * root.selected * (root.row-h / 1px) + 200px;
+        }
+    }
+}
+
 export component MainWindow inherits Window {
     title: "ds9-rust";
     background: Style.bg-deep;
@@ -604,6 +864,7 @@ export component MainWindow inherits Window {
     callback set-mode(string);
     callback menu-action(/*menu*/ string, /*item*/ string);
     callback catalog-row-activated(/*index*/ int);
+    callback key-shortcut(/*key*/ string);
 
     public function recenter-view-on(ix: float, iy: float) {
         // place image-pixel (ix,iy) at the centre of the canvas
@@ -620,6 +881,17 @@ export component MainWindow inherits Window {
         self.view-zoom = new-zoom;
     }
 
+    fs := FocusScope {
+        // capture single-letter shortcuts (A/D/S/M/V) for OGFinder-style
+        // catalog interaction. We forward Latin letters to Rust verbatim.
+        key-pressed(e) => {
+            // ignore repeats while holding modifier-only events (text empty)
+            if (e.text != "") {
+                root.key-shortcut(e.text);
+            }
+            accept
+        }
+
     VerticalLayout {
         spacing: 0px;
 
@@ -635,6 +907,8 @@ export component MainWindow inherits Window {
                             "Save Image…", "Save FITS…", "Save TIFF…", "Save JPEG…", "Save PostScript…",
                             "—", "Print…", "—",
                             "SAMP Send Image", "SAMP Send VOTable…",
+                            "—",
+                            "Export Reproduce Script…", "Import Reproduce Script…",
                             "—", "Quit"];
                     chosen(it) => { root.menu-action("File", it); }
                 }
@@ -708,7 +982,10 @@ export component MainWindow inherits Window {
                 }
                 MenuBarItem {
                     label: "Catalog";
-                    items: ["Load…", "Clear", "—", "Run SExtractor…", "Online Query…", "—", "Info"];
+                    items: ["Load…", "Clear", "—", "Run SExtractor…", "Run SEP…",
+                            "Online Query…", "—",
+                            "Show Catalog Window", "Mark All", "Clear Marks", "—",
+                            "Export TSV…", "Info"];
                     chosen(it) => { root.menu-action("Catalog", it); }
                 }
                 MenuBarItem {
@@ -1564,5 +1841,8 @@ export component MainWindow inherits Window {
                 }
             }
         }
+    }
+
+        init => { fs.focus(); }
     }
 }
