@@ -759,10 +759,10 @@ export component MainWindow inherits Window {
     in-out property <bool>     hdu-movie-active: false;
     callback hdu-row-clicked(int);
 
-    // ---- main canvas viewport (image-pixel coords) — derived from the
-    //      canvas Rectangle's actual size, populated below ----
-    in-out property <length> canvas-w: 800px;
-    in-out property <length> canvas-h: 600px;
+    // ---- main canvas viewport (image-pixel coords) — bound directly to the
+    //      canvas Rectangle so resize is always reflected ----
+    out property <length> canvas-w: canvas.width;
+    out property <length> canvas-h: canvas.height;
     property <float>  vp-x: view-zoom > 0 ? -view-pan-x / 1px / view-zoom : 0;
     property <float>  vp-y: view-zoom > 0 ? -view-pan-y / 1px / view-zoom : 0;
     property <float>  vp-w: view-zoom > 0 ? canvas-w / 1px / view-zoom : 0;
@@ -977,8 +977,6 @@ export component MainWindow inherits Window {
                 background: Style.bg-canvas;
                 border-color: Style.border;
                 border-width: 1px;
-                changed width  => { root.canvas-w = self.width; }
-                changed height => { root.canvas-h = self.height; }
 
                 img := Image {
                     source: root.fits-image;
