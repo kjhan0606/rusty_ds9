@@ -188,6 +188,18 @@ impl Catalog {
         Some((xi, yi))
     }
 
+    /// Look up SExtractor's shape columns A_IMAGE / B_IMAGE / THETA_IMAGE
+    /// (semi-major axis, semi-minor axis, position angle in degrees CCW from
+    /// +x). Returns None if any are missing — callers fall back to circles.
+    pub fn shape_columns(&self) -> Option<(usize, usize, usize)> {
+        let a  = self.col_index("A_IMAGE").or_else(|| self.col_index("AWIN_IMAGE"))?;
+        let b  = self.col_index("B_IMAGE").or_else(|| self.col_index("BWIN_IMAGE"))?;
+        let th = self.col_index("THETA_IMAGE")
+            .or_else(|| self.col_index("THETAWIN_IMAGE"))
+            .or_else(|| self.col_index("THETA"))?;
+        Some((a, b, th))
+    }
+
     /// Iterate (x, y) pairs for the standard image-coordinate columns,
     /// dropping any row that fails to parse.
     pub fn xy_iter(&self) -> impl Iterator<Item = (f64, f64)> + '_ {

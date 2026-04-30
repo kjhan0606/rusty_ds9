@@ -517,24 +517,10 @@ fn marker_color(m: &Marker) -> slint::Color {
 }
 
 fn build_mark_model(f: &Frame) -> ModelRc<Mark> {
-    let cat_count = f.catalog.as_ref().map(|c| c.len()).unwrap_or(0).min(5000);
-    let mut out: Vec<Mark> = Vec::with_capacity(f.markers.len() + cat_count);
-
-    // catalog points first so user-drawn regions paint on top
-    if let Some(cat) = &f.catalog {
-        let amber = slint::Color::from_argb_u8(0xff, 0xff, 0xc1, 0x07);
-        for (i, (x, y)) in cat.xy_iter().enumerate() {
-            if i >= 5000 { break; }
-            let (cx, cy) = fits_to_display_oriented(x, y, f);
-            let selected = f.selected_catalog == Some(i);
-            // make the selected source visibly bigger so it stands out at low zoom
-            let r = if selected { 8.0 } else { 4.0 };
-            out.push(Mark {
-                kind: 0, cx, cy, rx: r, ry: r,
-                color: amber, selected,
-            });
-        }
-    }
+    // Catalog points are baked into the line-overlay strip (ellipse outline +
+    // empty cross for the selected row); only user-drawn regions go through
+    // Marks now.
+    let mut out: Vec<Mark> = Vec::with_capacity(f.markers.len());
 
     for (i, m) in f.markers.iter().enumerate() {
         let color = marker_color(m);
@@ -611,6 +597,75 @@ fn render_line_overlay(f: &Frame) -> Option<Image> {
         let (dx, dy) = fits_to_display_oriented(fx, fy, f);
         (dx.round() as i32, dy.round() as i32)
     };
+
+    // Catalog markers — ellipse outline (or fallback circle) per row, with an
+    // empty cross drawn over the currently-selected row instead of a closed
+    // shape. Drawn first so user regions overpaint.
+    if let Some(cat) = &f.catalog {
+        let amber: [u8; 4] = [0xff, 0xc1, 0x07, 0xff];
+        let teal:  [u8; 4] = [0x4e, 0xc9, 0xb0, 0xff];
+        let xy = cat.xy_columns();
+        let abt = cat.shape_columns();
+        if let Some((xi, yi)) = xy {
+            for (i, row) in cat.rows.iter().enumerate() {
+                if i >= 5000 { break; }
+                let fx = match row.get(xi).and_then(|s| s.parse::<f64>().ok()) { Some(v) => v, None => continue };
+                let fy = match row.get(yi).and_then(|s| s.parse::<f64>().ok()) { Some(v) => v, None => continue };
+                let selected = f.selected_catalog == Some(i);
+
+                let (a_pix, b_pix, theta_rad) = match abt {
+                    Some((ai, bi, ti)) => {
+                        let a = row.get(ai).and_then(|s| s.parse::<f64>().ok()).unwrap_or(4.0).max(1.5);
+                        let b = row.get(bi).and_then(|s| s.parse::<f64>().ok()).unwrap_or(4.0).max(1.0);
+                        let t = row.get(ti).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0).to_radians();
+                        // SExtractor's A/B are σ-like — multiply by 2 so the
+                        // outline traces the visible source halo.
+                        (a * 2.0, b * 2.0, t)
+                    }
+                    None => (4.0, 4.0, 0.0),
+                };
+
+                if selected {
+                    // empty cross: 4 short ticks N/S/E/W with a gap at the
+                    // center, drawn in display space so it stays crisp.
+                    let (cx, cy) = to_xy(fx, fy);
+                    let (gap, len) = (5_i32, 12_i32);
+                    draw_line(bytes, cx, cy - gap, cx, cy - gap - len, teal); // up (display y-down)
+                    draw_line(bytes, cx, cy + gap, cx, cy + gap + len, teal); // down
+                    draw_line(bytes, cx - gap, cy, cx - gap - len, cy, teal); // left
+                    draw_line(bytes, cx + gap, cy, cx + gap + len, cy, teal); // right
+                    any = true;
+                } else {
+                    // sample the ellipse outline in FITS coords, project
+                    // through to_xy, connect with line segments. theta is
+                    // CCW from +x in FITS (y-up).
+                    let (st, ct) = (theta_rad.sin(), theta_rad.cos());
+                    const N: usize = 32;
+                    let mut prev: Option<(i32, i32)> = None;
+                    let mut first: Option<(i32, i32)> = None;
+                    for k in 0..=N {
+                        let u = k as f64 / N as f64 * std::f64::consts::TAU;
+                        let (cu, su) = (u.cos(), u.sin());
+                        let lx = a_pix * cu;
+                        let ly = b_pix * su;
+                        let ex = fx + lx * ct - ly * st;
+                        let ey = fy + lx * st + ly * ct;
+                        let (px, py) = to_xy(ex, ey);
+                        if let Some((p0, p1)) = prev {
+                            draw_line(bytes, p0, p1, px, py, amber);
+                        } else {
+                            first = Some((px, py));
+                        }
+                        prev = Some((px, py));
+                    }
+                    if let (Some(p), Some(fst)) = (prev, first) {
+                        draw_line(bytes, p.0, p.1, fst.0, fst.1, amber);
+                    }
+                    any = true;
+                }
+            }
+        }
+    }
 
     for m in &f.markers {
         let c = m.color;
@@ -5183,18 +5238,27 @@ fn main() -> Result<()> {
             if state.try_borrow_mut().is_err() { return; }
             let idx = idx as usize;
             let mut s = state.borrow_mut();
-            // Re-derive the (x, y) for that row from the catalog itself so we
-            // do not drift if the slint model and Rust state ever disagree.
             let xy = s.active_frame()
                 .and_then(|f| f.catalog.as_ref())
                 .and_then(|c| c.xy_iter().nth(idx));
             if let Some((x, y)) = xy {
-                if let Some(f) = s.active_frame_mut() { f.selected_catalog = Some(idx); }
-                refresh_view(&w, &s);
-                if let Some(f) = s.active_frame() {
-                    let (display_x, display_y) = fits_to_display_oriented(x, y, f);
-                    w.invoke_recenter_view_on(display_x, display_y);
+                let (display_x, display_y) = match s.active_frame() {
+                    Some(f) => fits_to_display_oriented(x, y, f),
+                    None => return,
+                };
+                let cw = w.get_canvas_w() as f64;
+                let ch = w.get_canvas_h() as f64;
+                let z  = w.get_view_zoom() as f64;
+                let new_pan_x = (cw * 0.5 - display_x as f64 * z) as f32;
+                let new_pan_y = (ch * 0.5 - display_y as f64 * z) as f32;
+                if let Some(f) = s.active_frame_mut() {
+                    f.selected_catalog = Some(idx);
+                    f.view_pan_x = new_pan_x;
+                    f.view_pan_y = new_pan_y;
                 }
+                w.set_view_pan_x(new_pan_x);
+                w.set_view_pan_y(new_pan_y);
+                refresh_view(&w, &s);
                 w.set_status_text(
                     format!("row {} @ ({:.1}, {:.1})", idx + 1, x, y).into(),
                 );
@@ -5231,17 +5295,26 @@ fn main() -> Result<()> {
                 .and_then(|f| f.catalog.as_ref())
                 .and_then(|c| c.xy_iter().nth(idx));
             if let Some((x, y)) = xy {
-                if let Some(f) = s.active_frame_mut() { f.selected_catalog = Some(idx); }
-                if let Some(f) = s.active_frame() {
-                    let (display_x, display_y) = fits_to_display_oriented(x, y, f);
-                    mw.invoke_recenter_view_on(display_x, display_y);
-                    save_view_into_active(&mw, &mut s);
-                    mw.set_status_text(
-                        format!("catwin: row {} @ fits ({:.1},{:.1}) disp ({:.1},{:.1})",
-                            idx + 1, x, y, display_x, display_y).into(),
-                    );
+                let (display_x, display_y) = match s.active_frame() {
+                    Some(f) => fits_to_display_oriented(x, y, f),
+                    None => return,
+                };
+                let cw = mw.get_canvas_w() as f64;
+                let ch = mw.get_canvas_h() as f64;
+                let z  = mw.get_view_zoom() as f64;
+                let new_pan_x = (cw * 0.5 - display_x as f64 * z) as f32;
+                let new_pan_y = (ch * 0.5 - display_y as f64 * z) as f32;
+                if let Some(f) = s.active_frame_mut() {
+                    f.selected_catalog = Some(idx);
+                    f.view_pan_x = new_pan_x;
+                    f.view_pan_y = new_pan_y;
                 }
+                mw.set_view_pan_x(new_pan_x);
+                mw.set_view_pan_y(new_pan_y);
                 refresh_view(&mw, &s);
+                mw.set_status_text(
+                    format!("catwin: row {} @ ({:.1}, {:.1})", idx + 1, x, y).into(),
+                );
             }
         });
     }
