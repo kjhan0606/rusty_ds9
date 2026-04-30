@@ -367,92 +367,6 @@ component Magnifier inherits Rectangle {
     }
 }
 
-/// Scrollable catalog table. Columns: id, x, y, mag. Click a row to ask the
-/// host to recenter the canvas on that source.
-component CatalogPanel inherits Rectangle {
-    in property <string> caption;
-    in property <[CatRow]> rows: [];
-    in property <int> selected: -1;
-    callback row-clicked(int);
-
-    background: Style.bg-sunken;
-    border-color: Style.border;
-    border-width: 1px;
-
-    property <length> row-h: 16px;
-
-    Text {
-        x: 6px; y: 4px;
-        text: root.caption + "  (" + root.rows.length + ")";
-        color: Style.text-dim;
-        font-size: 10px;
-        font-family: Style.mono;
-    }
-
-    // header
-    Rectangle {
-        x: 6px; y: 18px;
-        width: parent.width - 12px;
-        height: 14px;
-        background: Style.bg-panel;
-        HorizontalLayout {
-            padding-left: 4px; padding-right: 4px;
-            Text { text: "id";  color: Style.text-dim; font-size: 9px; font-family: Style.mono;
-                   horizontal-stretch: 1; vertical-alignment: center; }
-            Text { text: "x";   color: Style.text-dim; font-size: 9px; font-family: Style.mono;
-                   horizontal-stretch: 1; vertical-alignment: center; horizontal-alignment: right; }
-            Text { text: "y";   color: Style.text-dim; font-size: 9px; font-family: Style.mono;
-                   horizontal-stretch: 1; vertical-alignment: center; horizontal-alignment: right; }
-            Text { text: "mag"; color: Style.text-dim; font-size: 9px; font-family: Style.mono;
-                   horizontal-stretch: 1; vertical-alignment: center; horizontal-alignment: right; }
-        }
-    }
-
-    sv := ScrollView {
-        x: 6px; y: 34px;
-        width: parent.width - 12px;
-        height: parent.height - 38px;
-
-        // auto-scroll the selected row into view
-        changed viewport-y => { /* nothing — but binding required to permit assignment */ }
-
-        VerticalLayout {
-            spacing: 0px;
-            for r[i] in root.rows: Rectangle {
-                height: root.row-h;
-                background: i == root.selected
-                    ? Style.accent-dim
-                    : (rta.has-hover ? Style.bg-hover : transparent);
-                HorizontalLayout {
-                    padding-left: 4px; padding-right: 4px;
-                    Text { text: r.id; color: Style.text; font-size: 10px; font-family: Style.mono;
-                           horizontal-stretch: 1; vertical-alignment: center; }
-                    Text { text: round(r.x * 10) / 10; color: Style.text-dim;
-                           font-size: 10px; font-family: Style.mono;
-                           horizontal-stretch: 1; vertical-alignment: center; horizontal-alignment: right; }
-                    Text { text: round(r.y * 10) / 10; color: Style.text-dim;
-                           font-size: 10px; font-family: Style.mono;
-                           horizontal-stretch: 1; vertical-alignment: center; horizontal-alignment: right; }
-                    Text { text: r.mag; color: Style.text-dim;
-                           font-size: 10px; font-family: Style.mono;
-                           horizontal-stretch: 1; vertical-alignment: center; horizontal-alignment: right; }
-                }
-                rta := TouchArea {
-                    clicked => { root.row-clicked(i); }
-                }
-            }
-        }
-    }
-
-    // Slint exposes ScrollView.viewport-y as a length we can read/write.
-    // When the selected index changes from outside, reveal that row.
-    changed selected => {
-        if (root.selected >= 0) {
-            sv.viewport-y = -1px * root.selected * (root.row-h / 1px) + sv.height / 2 - root.row-h;
-        }
-    }
-}
-
 /// OGFinder-style standalone Catalog window. Larger table (id, x, y, ra, dec,
 /// mag, tag), toolbar (Mark All, Visible filter, Trim, Run SEP, Export),
 /// status bar. Bidirectionally synced with the main canvas via shared State.
@@ -982,7 +896,7 @@ export component MainWindow inherits Window {
                 }
                 MenuBarItem {
                     label: "Catalog";
-                    items: ["Load…", "Clear", "—", "Run SExtractor…", "Run SEP…",
+                    items: ["Load…", "Clear", "—", "Run SEP…",
                             "Online Query…", "—",
                             "Show Catalog Window", "Mark All", "Clear Marks", "—",
                             "Export TSV…", "Info"];
@@ -1783,13 +1697,6 @@ export component MainWindow inherits Window {
                     cursor-x: root.cursor-image-x;
                     cursor-y: root.cursor-image-y;
                     mag: 8.0;
-                }
-                CatalogPanel {
-                    caption: "CATALOG";
-                    rows: root.catalog-rows;
-                    selected: root.catalog-selected;
-                    vertical-stretch: 1;
-                    row-clicked(i) => { root.catalog-row-activated(i); }
                 }
             }
         }

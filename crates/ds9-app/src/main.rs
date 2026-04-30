@@ -4301,7 +4301,6 @@ fn handle_menu(window: &MainWindow, st: &mut State, menu: &str, item: &str) {
         // Catalog
         ("Catalog", "Load…") => { catalog_load(window, st); }
         ("Catalog", "Clear") => { catalog_clear(window, st); }
-        ("Catalog", "Run SExtractor…") => { run_sextractor(window, st); }
         ("Catalog", "Run SEP…") => { run_sep_python(window, st); }
         ("Catalog", "Online Query…") => {
             window.set_netcat_visible(!window.get_netcat_visible());
@@ -5233,14 +5232,16 @@ fn main() -> Result<()> {
                 .and_then(|c| c.xy_iter().nth(idx));
             if let Some((x, y)) = xy {
                 if let Some(f) = s.active_frame_mut() { f.selected_catalog = Some(idx); }
-                refresh_view(&mw, &s);
                 if let Some(f) = s.active_frame() {
                     let (display_x, display_y) = fits_to_display_oriented(x, y, f);
                     mw.invoke_recenter_view_on(display_x, display_y);
+                    save_view_into_active(&mw, &mut s);
+                    mw.set_status_text(
+                        format!("catwin: row {} @ fits ({:.1},{:.1}) disp ({:.1},{:.1})",
+                            idx + 1, x, y, display_x, display_y).into(),
+                    );
                 }
-                mw.set_status_text(
-                    format!("catwin: row {} @ ({:.1}, {:.1})", idx + 1, x, y).into(),
-                );
+                refresh_view(&mw, &s);
             }
         });
     }
@@ -5659,6 +5660,7 @@ fn main() -> Result<()> {
     };
     win.set_status_text(banner.into());
 
+    cat_win.show()?;
     win.run()?;
     Ok(())
 }
