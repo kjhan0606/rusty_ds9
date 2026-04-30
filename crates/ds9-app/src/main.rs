@@ -5675,7 +5675,26 @@ thread_local! {
 
 // ---------------------------------------------------------------- main --
 
+/// X11 forwarding from a remote SSH session usually can't get a GL ≥ 3.0
+/// context (macOS XQuartz only does indirect GLX up to 2.x, and Xorg
+/// disables indirect GL 3.0+ by default), so slint's femtovg/Skia
+/// renderers refuse to start. Detect that case and switch to slint's
+/// CPU rasterizer transparently. The user can still pin a backend with
+/// `SLINT_BACKEND=...` and we'll respect it.
+fn auto_pick_slint_backend() {
+    if std::env::var_os("SLINT_BACKEND").is_some() { return; }
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() { return; }
+    let in_ssh = std::env::var_os("SSH_CONNECTION").is_some()
+        || std::env::var_os("SSH_CLIENT").is_some()
+        || std::env::var_os("SSH_TTY").is_some();
+    let has_display = std::env::var_os("DISPLAY").is_some();
+    if in_ssh && has_display {
+        std::env::set_var("SLINT_BACKEND", "winit-software");
+    }
+}
+
 fn main() -> Result<()> {
+    auto_pick_slint_backend();
     let argv: Vec<String> = env::args().collect();
     let win = MainWindow::new()?;
     let cat_win = CatalogWindow::new()?;

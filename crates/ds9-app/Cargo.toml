@@ -9,7 +9,7 @@ name = "ds9"
 path = "src/main.rs"
 
 [dependencies]
-slint        = { workspace = true }
+slint        = { workspace = true, features = ["renderer-software"] }
 ds9-fits     = { workspace = true }
 ds9-image    = { workspace = true }
 ds9-marker   = { workspace = true }
