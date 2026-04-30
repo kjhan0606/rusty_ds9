@@ -80,6 +80,7 @@ global Style {
 component MenuBarItem inherits Rectangle {
     in property <string> label;
     in property <[string]> items;
+    in property <length> popup-width: 220px;
     callback chosen(string);
 
     background: ta.has-hover ? Style.bg-hover : transparent;
@@ -102,7 +103,7 @@ component MenuBarItem inherits Rectangle {
     popup := PopupWindow {
         x: 0px;
         y: root.height;
-        width:  220px;
+        width:  root.popup-width;
         height: root.items.length * 22px + 8px;
         close-policy: close-on-click-outside;
         Rectangle {
@@ -403,59 +404,116 @@ export component CatalogWindow inherits Window {
     VerticalLayout {
         spacing: 0px;
 
-        // ----- menu bar (OGFinder-style pulldowns) -----
+        // ----- menu bar (OGFinder hierarchy from ds9/library/layout.tcl) -----
+        // slint's MenuBarItem only supports flat lists; cascade submenus are
+        // flattened inline using "Parent: Child" labels.
         Rectangle {
             background: Style.bg-panel;
             height: Style.row-h-menu;
             HorizontalLayout {
                 spacing: 0px;
                 MenuBarItem {
-                    label: "File";
-                    items: ["Load Catalog…", "Clear Catalog", "—",
-                            "Export TSV…", "—",
-                            "Close Window"];
-                    chosen(it) => { root.menu-action("File", it); }
+                    label: "SExtractor";
+                    items: ["Extract", "Dual-Image Extract…", "Settings…", "—",
+                            "Trim…", "—",
+                            "Save Catalog", "Export Regions (.reg)", "Export FITS Table",
+                            "Load Catalog", "—",
+                            "Clear"];
+                    chosen(it) => { root.menu-action("SExtractor", it); }
                 }
                 MenuBarItem {
-                    label: "Edit";
-                    items: ["Mark All", "Clear Marks", "—",
-                            "Apply Trim", "Reset Trim", "—",
-                            "Sort by ID", "Sort by X", "Sort by Y", "Sort by Mag",
-                            "Sort by Tag"];
-                    chosen(it) => { root.menu-action("Edit", it); }
+                    label: "Objects";
+                    items: ["Mark All", "Clear Markers", "—",
+                            "Show Visible Only", "—",
+                            "Add Objects (Click+A)", "Delete Selected (Click+D)", "—",
+                            "Separate Selected (Click+S)", "Separate Settings…",
+                            "Save Separated Catalog…", "Load Separated Catalog…", "—",
+                            "AI Merge…"];
+                    chosen(it) => { root.menu-action("Objects", it); }
                 }
                 MenuBarItem {
-                    label: "View";
-                    items: ["Toggle Visible Filter", "—",
-                            "Center on Selected", "Mark Selected", "—",
-                            "Scroll to Top", "Scroll to Selected"];
-                    chosen(it) => { root.menu-action("View", it); }
+                    label: "Galaxy Model";
+                    items: ["AI Morphology Classification", "—",
+                            "Fit Elliptical Model", "Fit Spiral Model", "—",
+                            "Extract Parameters"];
+                    chosen(it) => { root.menu-action("Galaxy Model", it); }
                 }
                 MenuBarItem {
-                    label: "Tools";
-                    items: ["Run SEP…", "Online Query…", "—",
-                            "Tag Selected: M (merged)",
-                            "Tag Selected: S (split)",
-                            "Tag Selected: A (added)",
-                            "Tag Selected: F (flagged)",
-                            "Tag Selected: clear"];
-                    chosen(it) => { root.menu-action("Tools", it); }
+                    label: "Star(PSF)";
+                    popup-width: 260px;
+                    items: ["Find Stars: Combined", "Find Stars: CLASS_STAR", "Find Stars: FWHM", "—",
+                            "Show Stars", "Clear Stars", "—",
+                            "Build PSF: Median Stack", "Build PSF: Moffat Fit",
+                            "Build PSF: Gaussian Fit", "Build PSF: ePSF",
+                            "Build PSF: Extended…",
+                            "Build PSF: WebbPSF (JWST)…", "Build PSF: TinyTim (HST)…", "—",
+                            "View PSF", "Save PSF…", "Load PSF…",
+                            "AI Star Classification", "—",
+                            "Settings…"];
+                    chosen(it) => { root.menu-action("Star(PSF)", it); }
                 }
                 MenuBarItem {
-                    label: "Pipeline";
-                    items: ["Star Finder…", "PSF Photometry…", "Crowded Photometry…",
-                            "—",
-                            "Morphometry (CAS/Gini/M20)…", "Sérsic Fit…", "Bulge-Disk Decomp…",
-                            "—",
-                            "ICL Estimate…", "LSBG Search…",
-                            "—",
-                            "Photo-z…", "SED Fit…", "AI Merge Suggest…"];
-                    chosen(it) => { root.menu-action("Pipeline", it); }
+                    label: "Deconvolution";
+                    items: ["Richardson-Lucy", "Richardson-Lucy (Accelerated)",
+                            "Richardson-Lucy (Regularized)", "—",
+                            "Wiener", "Tikhonov", "—",
+                            "CLEAN", "Maximum Entropy (MEM)", "—",
+                            "Settings…", "Quick Deconvolve (RL)"];
+                    chosen(it) => { root.menu-action("Deconvolution", it); }
                 }
                 MenuBarItem {
-                    label: "Help";
-                    items: ["About Catalog Window", "Tag Conventions", "Trim Syntax"];
-                    chosen(it) => { root.menu-action("Help", it); }
+                    label: "ICL";
+                    popup-width: 260px;
+                    items: ["1. Source Masking", "1. View Mask",
+                            "1. Save Mask As…", "1. Import Mask…", "—",
+                            "2. Background: Polynomial Fit",
+                            "2. Background: Chebyshev Fit",
+                            "2. Background: SEP Large Mesh",
+                            "2. View Background", "—",
+                            "3. Set BCG Center", "3. Measure Profile",
+                            "3. Sector Profile…", "—",
+                            "4. ICL Measurements", "4. Multi-Threshold ICL", "—",
+                            "5. BCG+ICL Decomposition", "—",
+                            "Color Profile…", "—",
+                            "Save Profile…", "Load Profile…", "—",
+                            "Export Script…", "Import Script…", "—",
+                            "Settings…"];
+                    chosen(it) => { root.menu-action("ICL", it); }
+                }
+                MenuBarItem {
+                    label: "LSBG";
+                    popup-width: 280px;
+                    items: ["1. Mask Bright Sources", "1. View Masked Image",
+                            "1. Save Mask As…", "1. Import Mask…", "—",
+                            "2. Background: SEP Large Mesh",
+                            "2. Background: Polynomial Fit",
+                            "2. Background: Chebyshev Fit",
+                            "2. View Cleaned Image", "—",
+                            "3. Detect LSBG Candidates", "—",
+                            "4. Photometry", "—",
+                            "5. Sérsic Profile Fit", "—",
+                            "6. Filter + Grade", "—",
+                            "7. SVM Classify", "—",
+                            "Save Catalog…", "Load Catalog…", "—",
+                            "8. Forced Photometry (Multi-Band)", "—",
+                            "Run Full Pipeline", "—",
+                            "Export Script…", "Import Script…", "—",
+                            "Settings…"];
+                    chosen(it) => { root.menu-action("LSBG", it); }
+                }
+                MenuBarItem {
+                    label: "Analysis";
+                    popup-width: 320px;
+                    items: ["Non-Parametric Morphology (CAS/Gini/M20)",
+                            "Sérsic Fitting", "—",
+                            "PSF Photometry", "Multi-Band Photometry…",
+                            "Crowded Field Photometry", "—",
+                            "Cross-Match (VizieR)…", "—",
+                            "Segmentation Map", "Completeness Simulation…", "—",
+                            "Interactive Plot…", "Photo-z (AI)…",
+                            "SED Fitting (AI)…", "Bulge+Disk Decomp…", "—",
+                            "Analysis Viewer…"];
+                    chosen(it) => { root.menu-action("Analysis", it); }
                 }
                 Rectangle { horizontal-stretch: 1; }
             }

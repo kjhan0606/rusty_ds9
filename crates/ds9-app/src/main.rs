@@ -2783,38 +2783,12 @@ fn apply_trim_expression(window: &MainWindow, st: &mut State, expr: &str) {
     refresh_view(window, st);
 }
 
-/// Sort the active frame's catalog by the first column whose name matches one
-/// of `candidates` (case-sensitive, in priority order). Resets cat_trim/cat_tag
-/// because their indices are tied to the previous row order.
-fn catalog_sort_by(window: &MainWindow, st: &mut State, candidates: &[&str]) {
-    let Some(f) = st.active_frame_mut() else {
-        window.set_status_text("sort: no active frame".into()); return;
-    };
-    let Some(cat) = f.catalog.as_mut() else {
-        window.set_status_text("sort: no catalog loaded".into()); return;
-    };
-    let col = candidates.iter().find_map(|n| cat.col_index(n));
-    let Some(col) = col else {
-        window.set_status_text(
-            format!("sort: none of {candidates:?} found in catalog").into()
-        );
-        return;
-    };
-    let col_name = cat.columns[col].clone();
-    cat.sort_by(col, ds9_catalog::SortDir::Asc);
-    f.cat_trim.clear();
-    f.cat_tag.clear();
-    f.sync_catalog_aux();
-    f.selected_catalog = None;
-    window.set_status_text(
-        format!("sort: by {col_name} (asc); trim/tags reset").into()
-    );
-    refresh_view(window, st);
-}
-
-/// Dispatcher for OGFinder-style pulldown menus on the standalone Catalog
-/// window. Mirrors many of the items in MainWindow's Catalog/Pipeline menus
-/// plus a few catalog-window-specific actions (sort, tag selected, scroll).
+/// Dispatcher for the OGFinder-style pulldown menus on the standalone Catalog
+/// window. Menu hierarchy mirrors `OGFinder/ds9/library/layout.tcl`
+/// (SExtractor / Objects / Galaxy Model / Star(PSF) / Deconvolution / ICL /
+/// LSBG / Analysis). Submenus are flattened inline as "Parent: Child" labels.
+/// Items that map to existing helpers are wired; the rest fall through to a
+/// "not yet wired" status message — true placeholder behaviour, no fake work.
 fn catwin_menu_action(
     window: &MainWindow,
     cat: &CatalogWindow,
@@ -2823,49 +2797,21 @@ fn catwin_menu_action(
     item: &str,
 ) {
     match (menu, item) {
-        // ---- File ----
-        ("File", "Load Catalog…") => catalog_load(window, st),
-        ("File", "Clear Catalog") => catalog_clear(window, st),
-        ("File", "Export TSV…")   => catalog_export_tsv(window, st),
-        ("File", "Close Window")  => { let _ = cat.hide(); }
-
-        // ---- Edit ----
-        ("Edit", "Mark All")    => catalog_mark_all(window, st),
-        ("Edit", "Clear Marks") => catalog_clear_marks(window, st),
-        ("Edit", "Apply Trim")  => {
+        // -------- SExtractor --------
+        ("SExtractor", "Extract")            => run_sep_python(window, st),
+        ("SExtractor", "Load Catalog")       => catalog_load(window, st),
+        ("SExtractor", "Clear")              => catalog_clear(window, st),
+        ("SExtractor", "Save Catalog")       => catalog_export_tsv(window, st),
+        ("SExtractor", "Trim…")              => {
             let expr = cat.get_trim_expression().to_string();
             apply_trim_expression(window, st, &expr);
         }
-        ("Edit", "Reset Trim") => {
-            cat.set_trim_expression("".into());
-            apply_trim_expression(window, st, "");
-        }
-        ("Edit", "Sort by ID")  => catalog_sort_by(window, st, &["NUMBER","ID","id","number"]),
-        ("Edit", "Sort by X")   => catalog_sort_by(window, st, &["X_IMAGE","XWIN_IMAGE","X","x"]),
-        ("Edit", "Sort by Y")   => catalog_sort_by(window, st, &["Y_IMAGE","YWIN_IMAGE","Y","y"]),
-        ("Edit", "Sort by Mag") => catalog_sort_by(window, st, &["MAG_AUTO","MAG_APER","MAG","mag","mag_auto"]),
-        ("Edit", "Sort by Tag") => {
-            // sort by parallel cat_tag array: stable bucket by tag string
-            if let Some(f) = st.active_frame_mut() {
-                let n = f.cat_tag.len();
-                let mut idx: Vec<usize> = (0..n).collect();
-                idx.sort_by(|&a, &b| f.cat_tag[a].cmp(&f.cat_tag[b]));
-                if let Some(c) = f.catalog.as_mut() {
-                    let new_rows: Vec<_> = idx.iter().map(|&i| c.rows[i].clone()).collect();
-                    c.rows = new_rows;
-                }
-                let new_tag: Vec<String> = idx.iter().map(|&i| f.cat_tag[i].clone()).collect();
-                let new_trim: Vec<bool>  = idx.iter().map(|&i| f.cat_trim.get(i).copied().unwrap_or(true)).collect();
-                f.cat_tag  = new_tag;
-                f.cat_trim = new_trim;
-                f.selected_catalog = None;
-            }
-            window.set_status_text("sort: by tag".into());
-            refresh_view(window, st);
-        }
+        ("SExtractor", "Export Regions (.reg)") => region_save(window, st),
 
-        // ---- View ----
-        ("View", "Toggle Visible Filter") => {
+        // -------- Objects --------
+        ("Objects", "Mark All")        => catalog_mark_all(window, st),
+        ("Objects", "Clear Markers")   => catalog_clear_marks(window, st),
+        ("Objects", "Show Visible Only") => {
             let on = !cat.get_visible_filter();
             cat.set_visible_filter(on);
             st.cat_visible_filter = on;
@@ -2874,118 +2820,56 @@ fn catwin_menu_action(
             );
             refresh_view(window, st);
         }
-        ("View", "Center on Selected") => {
-            let sel = st.active_frame().and_then(|f| f.selected_catalog);
-            if let Some(idx) = sel {
-                cat.invoke_row_activated(idx as i32);
-            } else {
-                window.set_status_text("center: no catalog row selected".into());
-            }
-        }
-        ("View", "Mark Selected") => {
-            let info = st.active_frame_mut().and_then(|f| {
-                let idx = f.selected_catalog?;
-                let c = f.catalog.as_ref()?;
-                let (x, y) = c.xy_iter().nth(idx)?;
-                let r = (f.fits.width.min(f.fits.height) as f64 * 0.005).max(4.0);
-                let mut m = ds9_marker::Marker::circle(x, y, r);
-                m.color = [0xff, 0xc1, 0x07, 0xff];
-                m.width = 1.0;
-                m.tags.push("catalog".into());
-                f.markers.push(m);
-                Some((idx, x, y))
-            });
-            match info {
-                Some((idx, x, y)) => {
-                    window.set_status_text(
-                        format!("marked row {} @ ({:.1}, {:.1})", idx + 1, x, y).into()
-                    );
-                    refresh_view(window, st);
-                }
-                None => window.set_status_text("mark-selected: no row selected".into()),
-            }
-        }
-        ("View", "Scroll to Top") => {
-            cat.set_selected(-1);
-        }
-        ("View", "Scroll to Selected") => {
-            let idx = st.active_frame()
-                .and_then(|f| f.selected_catalog)
-                .map(|i| i as i32)
-                .unwrap_or(-1);
-            cat.set_selected(idx);
-        }
+        ("Objects", "AI Merge…") => pipeline_run_stub_task(window, st, "aimerge"),
 
-        // ---- Tools ----
-        ("Tools", "Run SEP…")      => run_sep_python(window, st),
-        ("Tools", "Online Query…") => {
+        // -------- Star(PSF) --------
+        ("Star(PSF)", "Find Stars: Combined")
+            | ("Star(PSF)", "Find Stars: CLASS_STAR")
+            | ("Star(PSF)", "Find Stars: FWHM")
+            | ("Star(PSF)", "AI Star Classification")
+            => pipeline_run_catalog_task(window, st, "starfind", vec![]),
+
+        // -------- Analysis --------
+        ("Analysis", "Non-Parametric Morphology (CAS/Gini/M20)")
+            => pipeline_run_region_text_task(window, st, "morphometry"),
+        ("Analysis", "Sérsic Fitting")    => pipeline_run_region_text_task(window, st, "sersic"),
+        ("Analysis", "PSF Photometry")    => pipeline_run_catalog_task(window, st, "psfphot",  vec![]),
+        ("Analysis", "Crowded Field Photometry")
+            => pipeline_run_catalog_task(window, st, "crowded",  vec![]),
+        ("Analysis", "Photo-z (AI)…")     => pipeline_run_stub_task(window, st, "photoz"),
+        ("Analysis", "SED Fitting (AI)…") => pipeline_run_stub_task(window, st, "sed"),
+        ("Analysis", "Bulge+Disk Decomp…")
+            => pipeline_run_region_text_task(window, st, "bulgedisk"),
+        ("Analysis", "Cross-Match (VizieR)…") => {
             window.set_netcat_visible(!window.get_netcat_visible());
             window.set_status_text(
                 if window.get_netcat_visible() { "online catalog query: shown".into() }
                 else                            { "online catalog query: hidden".into() }
             );
         }
-        ("Tools", t) if t.starts_with("Tag Selected:") => {
-            let tag = match t {
-                "Tag Selected: M (merged)"  => "M",
-                "Tag Selected: S (split)"   => "S",
-                "Tag Selected: A (added)"   => "A",
-                "Tag Selected: F (flagged)" => "F",
-                "Tag Selected: clear"       => "",
-                _ => "",
-            };
-            let applied = st.active_frame_mut().and_then(|f| {
-                let idx = f.selected_catalog?;
-                if idx >= f.cat_tag.len() { f.sync_catalog_aux(); }
-                if idx < f.cat_tag.len() {
-                    f.cat_tag[idx] = tag.to_string();
-                    Some(idx)
-                } else { None }
-            });
-            match applied {
-                Some(idx) => {
-                    window.set_status_text(
-                        format!("tag row {} → '{tag}'", idx + 1).into()
-                    );
-                    refresh_view(window, st);
-                }
-                None => window.set_status_text("tag: no row selected".into()),
-            }
-        }
 
-        // ---- Pipeline (mirror of MainWindow's Pipeline menu) ----
-        ("Pipeline", "Star Finder…")        => pipeline_run_catalog_task(window, st, "starfind", vec![]),
-        ("Pipeline", "PSF Photometry…")     => pipeline_run_catalog_task(window, st, "psfphot",  vec![]),
-        ("Pipeline", "Crowded Photometry…") => pipeline_run_catalog_task(window, st, "crowded",  vec![]),
-        ("Pipeline", "Morphometry (CAS/Gini/M20)…") => pipeline_run_region_text_task(window, st, "morphometry"),
-        ("Pipeline", "Sérsic Fit…")         => pipeline_run_region_text_task(window, st, "sersic"),
-        ("Pipeline", "Bulge-Disk Decomp…")  => pipeline_run_region_text_task(window, st, "bulgedisk"),
-        ("Pipeline", "ICL Estimate…")       => pipeline_run_region_text_task(window, st, "icl"),
-        ("Pipeline", "LSBG Search…")        => pipeline_run_catalog_task(window, st, "lsbg", vec![]),
-        ("Pipeline", "Photo-z…")            => pipeline_run_stub_task(window, st, "photoz"),
-        ("Pipeline", "SED Fit…")            => pipeline_run_stub_task(window, st, "sed"),
-        ("Pipeline", "AI Merge Suggest…")   => pipeline_run_stub_task(window, st, "aimerge"),
+        // -------- ICL --------
+        ("ICL", "1. Source Masking")
+            | ("ICL", "4. ICL Measurements")
+            | ("ICL", "4. Multi-Threshold ICL")
+            | ("ICL", "5. BCG+ICL Decomposition")
+            => pipeline_run_region_text_task(window, st, "icl"),
 
-        // ---- Help ----
-        ("Help", "About Catalog Window") => {
-            window.set_status_text(
-                "Catalog window — OGFinder-style table viewer. \
-                 Click row to recenter; A/D/S keys tag at hover; M marks all visible.".into()
-            );
-        }
-        ("Help", "Tag Conventions") => {
-            window.set_status_text(
-                "Tags: M=merged, S=split, A=added, F=flagged. Use Tools ▸ Tag Selected to assign.".into()
-            );
-        }
-        ("Help", "Trim Syntax") => {
-            window.set_status_text(
-                "Trim: '<col> <op> <val> [and|or <col> <op> <val>]'. Ops: < <= > >= = !=.".into()
-            );
-        }
+        // -------- LSBG --------
+        ("LSBG", "1. Mask Bright Sources")
+            | ("LSBG", "3. Detect LSBG Candidates")
+            | ("LSBG", "4. Photometry")
+            | ("LSBG", "5. Sérsic Profile Fit")
+            | ("LSBG", "6. Filter + Grade")
+            | ("LSBG", "7. SVM Classify")
+            | ("LSBG", "Run Full Pipeline")
+            => pipeline_run_catalog_task(window, st, "lsbg", vec![]),
+        ("LSBG", "Save Catalog…") => catalog_export_tsv(window, st),
+        ("LSBG", "Load Catalog…") => catalog_load(window, st),
 
+        // -------- everything else: placeholder until each step is ported --------
         _ => {
-            window.set_status_text(format!("catwin: {menu} ▸ {item} (not wired)").into());
+            window.set_status_text(format!("catwin: {menu} ▸ {item} (not yet wired)").into());
         }
     }
 }
