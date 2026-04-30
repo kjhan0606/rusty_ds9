@@ -1702,6 +1702,13 @@ export component MainWindow inherits Window {
                     cursor-y: root.cursor-image-y;
                     mag: 8.0;
                 }
+                // Spacer with vertical-stretch is required: without one
+                // stretchable child here, the sidebar VerticalLayout reports
+                // a finite max-height (sum of Panner+Magnifier ≈ 310px). The
+                // parent HorizontalLayout takes min of its children's
+                // max-heights, which propagates to the Window and locks
+                // vertical resize on macOS.
+                Rectangle { vertical-stretch: 1; }
             }
         }
 
