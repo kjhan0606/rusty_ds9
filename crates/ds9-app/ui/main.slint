@@ -796,24 +796,22 @@ export component MainWindow inherits Window {
     }
 
     forward-focus: fs;
-    fs := FocusScope {
-        width: 0px;
-        height: 0px;
-        // capture single-letter shortcuts (A/D/S/M/V) for OGFinder-style
-        // catalog interaction. We forward Latin letters to Rust verbatim.
-        key-pressed(e) => {
-            // ignore repeats while holding modifier-only events (text empty)
-            if (e.text != "") {
-                root.key-shortcut(e.text);
-            }
-            accept
-        }
-    }
 
     VerticalLayout {
-        width:  root.width;
-        height: root.height;
         spacing: 0px;
+
+        // zero-height key-capture. Must live inside the layout, not wrap or
+        // sit beside it — on macOS slint propagates the FocusScope's intrinsic
+        // max-height to the OS window and resize gets locked.
+        fs := FocusScope {
+            height: 0px;
+            key-pressed(e) => {
+                if (e.text != "") {
+                    root.key-shortcut(e.text);
+                }
+                accept
+            }
+        }
 
         // ---------------- menu bar ----------------
         Rectangle {
