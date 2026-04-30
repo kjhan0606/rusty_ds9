@@ -989,6 +989,16 @@ export component MainWindow inherits Window {
                     chosen(it) => { root.menu-action("Catalog", it); }
                 }
                 MenuBarItem {
+                    label: "Pipeline";
+                    items: ["Star Finder…", "PSF Photometry…", "Crowded Photometry…",
+                            "PSF Deconvolution…", "—",
+                            "Morphometry (CAS/Gini/M20)…", "Sérsic Fit…",
+                            "Bulge-Disk Decomp…", "—",
+                            "ICL Estimate…", "LSBG Search…", "—",
+                            "Photo-z…", "SED Fit…", "AI Merge Suggest…"];
+                    chosen(it) => { root.menu-action("Pipeline", it); }
+                }
+                MenuBarItem {
                     label: "Help";
                     items: ["About ds9-rust"];
                     chosen(it) => { root.menu-action("Help", it); }

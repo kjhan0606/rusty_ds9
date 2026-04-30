@@ -2466,6 +2466,168 @@ sys.stderr.write(f"sep: extracted {len(objs)} sources\n")
     }
 }
 
+// -------------------------------------------- OGFinder pipelines (sidecar) --
+
+/// Inline Python helper for the OGFinder analysis pipelines. Dispatches on
+/// the first arg (`task`). Each task writes either `out.tsv` (catalog),
+/// `out.fits` (image), or just prints a one-line status. Heavy ML tasks
+/// (photo-z, SED, AI merge) are stubs that point at $OGFINDER_HOME — full
+/// pipelines live in OGFinder's tree.
+const PIPELINE_PY: &str = include_str!("pipelines.py");
+
+/// Run the inline Python pipeline for `task`. Returns the temp dir that the
+/// helper wrote outputs to (so callers can pick up `out.tsv` / `out.fits`),
+/// or None on failure.
+fn run_python_pipeline(
+    window: &MainWindow,
+    task: &str,
+    fits_path: &Path,
+    extra_args: &[String],
+) -> Option<PathBuf> {
+    let py: Option<String> = ["python3", "python"].iter().find_map(|n| {
+        std::process::Command::new(n)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .ok()
+            .map(|_| n.to_string())
+    });
+    let Some(py) = py else {
+        window.set_status_text(format!("{task}: no python3 / python on PATH").into());
+        return None;
+    };
+    let tmp = std::env::temp_dir()
+        .join(format!("ds9-rust-{task}-{}", std::process::id()));
+    if let Err(e) = std::fs::create_dir_all(&tmp) {
+        window.set_status_text(format!("{task}: tmpdir: {e}").into());
+        return None;
+    }
+    let helper = tmp.join("ds9rust_pipeline.py");
+    if let Err(e) = std::fs::write(&helper, PIPELINE_PY) {
+        window.set_status_text(format!("{task}: write helper: {e}").into());
+        return None;
+    }
+    let mut cmd = std::process::Command::new(&py);
+    cmd.arg(&helper).arg(task).arg(fits_path).arg(&tmp);
+    for a in extra_args { cmd.arg(a); }
+    window.set_status_text(format!("{task}: running…").into());
+    let output = match cmd.output() {
+        Ok(o) => o,
+        Err(e) => {
+            window.set_status_text(format!("{task}: spawn: {e}").into());
+            return None;
+        }
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    if !output.status.success() {
+        let last = stderr.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("");
+        window.set_status_text(format!("{task} failed: {last}").into());
+        return None;
+    }
+    let summary = stdout.lines().rev().find(|l| !l.trim().is_empty())
+        .unwrap_or("done").to_string();
+    window.set_status_text(format!("{task}: {summary}").into());
+    Some(tmp)
+}
+
+fn active_frame_path(st: &State) -> Option<(usize, PathBuf)> {
+    let f = st.active_frame()?;
+    let p = f.source_path.clone()?;
+    Some((st.active, p))
+}
+
+/// Pull (cx, cy, r) from the currently selected marker (in fits coords),
+/// falling back to the active frame's image centre if nothing is selected.
+fn selected_circle_or_center(st: &State) -> Option<(f64, f64, f64)> {
+    let f = st.active_frame()?;
+    if let Some(idx) = f.selected_marker {
+        if let Some(m) = f.markers.get(idx) {
+            use ds9_marker::Shape;
+            return Some(match &m.shape {
+                Shape::Circle  { center, r }                  => (center.x, center.y, *r),
+                Shape::Box     { center, w, h, .. }           => (center.x, center.y, w.max(*h) * 0.5),
+                Shape::Ellipse { center, a, b, .. }           => (center.x, center.y, a.max(*b)),
+                Shape::Annulus { center, r_outer, .. }        => (center.x, center.y, *r_outer),
+                Shape::Point   { center }                     => (center.x, center.y, 30.0),
+                _ => (f.fits.width as f64 * 0.5, f.fits.height as f64 * 0.5, 60.0),
+            });
+        }
+    }
+    Some((f.fits.width as f64 * 0.5, f.fits.height as f64 * 0.5, 60.0))
+}
+
+fn pipeline_load_catalog_result(window: &MainWindow, st: &mut State, tmp: &Path, label: &str) {
+    let out = tmp.join("out.tsv");
+    if !out.exists() {
+        return; // status already populated by run_python_pipeline
+    }
+    match Catalog::from_path(&out) {
+        Ok(c) => {
+            let n = c.len();
+            let active = st.active;
+            if let Some(f) = st.frames.get_mut(active) {
+                f.catalog = Some(c);
+                f.selected_catalog = None;
+                f.sync_catalog_aux();
+            }
+            refresh_view(window, st);
+            window.set_status_text(format!("{label}: loaded {n} sources").into());
+        }
+        Err(e) => window.set_status_text(format!("{label}: read catalog: {e}").into()),
+    }
+}
+
+/// Catalog-producing tasks (starfind, psfphot, crowded, lsbg) — run the
+/// pipeline, then load `out.tsv` as the active frame's catalog.
+fn pipeline_run_catalog_task(window: &MainWindow, st: &mut State, label: &str, extra: Vec<String>) {
+    let Some((_, fits_path)) = active_frame_path(st) else {
+        window.set_status_text(format!("{label}: active frame has no on-disk path").into());
+        return;
+    };
+    if let Some(tmp) = run_python_pipeline(window, label, &fits_path, &extra) {
+        pipeline_load_catalog_result(window, st, &tmp, label);
+    }
+}
+
+/// Region-based tasks that print a one-line summary (morphometry, sersic,
+/// bulgedisk, icl). Uses the selected marker for cx/cy/r.
+fn pipeline_run_region_text_task(window: &MainWindow, st: &mut State, label: &str) {
+    let Some((_, fits_path)) = active_frame_path(st) else {
+        window.set_status_text(format!("{label}: active frame has no on-disk path").into());
+        return;
+    };
+    let Some((cx, cy, r)) = selected_circle_or_center(st) else { return };
+    let extra = vec![
+        format!("--cx={cx}"),
+        format!("--cy={cy}"),
+        format!("--r={r}"),
+    ];
+    let _ = run_python_pipeline(window, label, &fits_path, &extra);
+}
+
+/// Image-producing tasks (deconv) — run pipeline, load `out.fits` as a new frame.
+fn pipeline_run_image_task(window: &MainWindow, st: &mut State, label: &str) {
+    let Some((_, fits_path)) = active_frame_path(st) else {
+        window.set_status_text(format!("{label}: active frame has no on-disk path").into());
+        return;
+    };
+    if let Some(tmp) = run_python_pipeline(window, label, &fits_path, &[]) {
+        let out = tmp.join("out.fits");
+        if out.exists() {
+            load_into(window, st, &out);
+        }
+    }
+}
+
+/// Stub tasks (photo-z, SED, AI merge) — print the OGFinder hint.
+fn pipeline_run_stub_task(window: &MainWindow, st: &mut State, label: &str) {
+    let fits_path = active_frame_path(st).map(|(_, p)| p)
+        .unwrap_or_else(|| std::env::temp_dir().join("placeholder.fits"));
+    let _ = run_python_pipeline(window, label, &fits_path, &[]);
+}
+
 /// Apply a textual trim expression to the active frame's `cat_trim`. Supports
 /// simple `<column> <op> <value>` clauses chained with `and` / `or`.
 /// Empty expression resets the trim mask.
@@ -4177,6 +4339,20 @@ fn handle_menu(window: &MainWindow, st: &mut State, menu: &str, item: &str) {
             };
             window.set_status_text(msg.into());
         }
+
+        // Pipeline (OGFinder-style Python sidecars)
+        ("Pipeline", "Star Finder…")        => pipeline_run_catalog_task(window, st, "starfind", vec![]),
+        ("Pipeline", "PSF Photometry…")     => pipeline_run_catalog_task(window, st, "psfphot",  vec![]),
+        ("Pipeline", "Crowded Photometry…") => pipeline_run_catalog_task(window, st, "crowded",  vec![]),
+        ("Pipeline", "PSF Deconvolution…")  => pipeline_run_image_task(window, st, "deconv"),
+        ("Pipeline", "Morphometry (CAS/Gini/M20)…") => pipeline_run_region_text_task(window, st, "morphometry"),
+        ("Pipeline", "Sérsic Fit…")         => pipeline_run_region_text_task(window, st, "sersic"),
+        ("Pipeline", "Bulge-Disk Decomp…")  => pipeline_run_region_text_task(window, st, "bulgedisk"),
+        ("Pipeline", "ICL Estimate…")       => pipeline_run_region_text_task(window, st, "icl"),
+        ("Pipeline", "LSBG Search…")        => pipeline_run_catalog_task(window, st, "lsbg", vec![]),
+        ("Pipeline", "Photo-z…")            => pipeline_run_stub_task(window, st, "photoz"),
+        ("Pipeline", "SED Fit…")            => pipeline_run_stub_task(window, st, "sed"),
+        ("Pipeline", "AI Merge Suggest…")   => pipeline_run_stub_task(window, st, "aimerge"),
 
         // Analysis — smoothing
         ("Analysis", "Smooth (cycle)") => {
