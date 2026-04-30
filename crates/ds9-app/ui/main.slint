@@ -395,11 +395,72 @@ export component CatalogWindow inherits Window {
     callback run-sep-clicked();
     callback export-tsv-clicked();
     callback close-requested();
+    // OGFinder-style pulldowns. menu = "File"/"Edit"/"View"/"Tools"/"Pipeline"/"Help".
+    callback menu-action(/*menu*/ string, /*item*/ string);
 
     property <length> row-h: 18px;
 
     VerticalLayout {
         spacing: 0px;
+
+        // ----- menu bar (OGFinder-style pulldowns) -----
+        Rectangle {
+            background: Style.bg-panel;
+            height: Style.row-h-menu;
+            HorizontalLayout {
+                spacing: 0px;
+                MenuBarItem {
+                    label: "File";
+                    items: ["Load Catalog…", "Clear Catalog", "—",
+                            "Export TSV…", "—",
+                            "Close Window"];
+                    chosen(it) => { root.menu-action("File", it); }
+                }
+                MenuBarItem {
+                    label: "Edit";
+                    items: ["Mark All", "Clear Marks", "—",
+                            "Apply Trim", "Reset Trim", "—",
+                            "Sort by ID", "Sort by X", "Sort by Y", "Sort by Mag",
+                            "Sort by Tag"];
+                    chosen(it) => { root.menu-action("Edit", it); }
+                }
+                MenuBarItem {
+                    label: "View";
+                    items: ["Toggle Visible Filter", "—",
+                            "Center on Selected", "Mark Selected", "—",
+                            "Scroll to Top", "Scroll to Selected"];
+                    chosen(it) => { root.menu-action("View", it); }
+                }
+                MenuBarItem {
+                    label: "Tools";
+                    items: ["Run SEP…", "Online Query…", "—",
+                            "Tag Selected: M (merged)",
+                            "Tag Selected: S (split)",
+                            "Tag Selected: A (added)",
+                            "Tag Selected: F (flagged)",
+                            "Tag Selected: clear"];
+                    chosen(it) => { root.menu-action("Tools", it); }
+                }
+                MenuBarItem {
+                    label: "Pipeline";
+                    items: ["Star Finder…", "PSF Photometry…", "Crowded Photometry…",
+                            "—",
+                            "Morphometry (CAS/Gini/M20)…", "Sérsic Fit…", "Bulge-Disk Decomp…",
+                            "—",
+                            "ICL Estimate…", "LSBG Search…",
+                            "—",
+                            "Photo-z…", "SED Fit…", "AI Merge Suggest…"];
+                    chosen(it) => { root.menu-action("Pipeline", it); }
+                }
+                MenuBarItem {
+                    label: "Help";
+                    items: ["About Catalog Window", "Tag Conventions", "Trim Syntax"];
+                    chosen(it) => { root.menu-action("Help", it); }
+                }
+                Rectangle { horizontal-stretch: 1; }
+            }
+        }
+        Rectangle { height: 1px; background: Style.accent-dim; }
 
         // ----- toolbar -----
         Rectangle {
