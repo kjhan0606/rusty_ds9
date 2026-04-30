@@ -144,6 +144,35 @@ struct Frame {
     /// Per-row OGFinder-style classification tag: "" / "M" merge / "S" split /
     /// "A" added / "F" flagged. Parallel to the kept rows.
     cat_tag: Vec<String>,
+    /// Multi-step ICL pipeline stage outputs (file paths into the per-frame
+    /// temp dir). Populated by ICL menu items as the user walks 1→5.
+    icl: IclState,
+    /// Multi-step LSBG pipeline stage outputs.
+    lsbg: LsbgState,
+}
+
+/// Cached file paths for OGFinder's `ds9_icl.py` multi-stage pipeline. Each
+/// step writes its output here so the next step (e.g. profile → measure) can
+/// pick it up without re-running the upstream stage.
+#[derive(Default, Clone, Debug)]
+struct IclState {
+    mask: Option<PathBuf>,
+    bkg: Option<PathBuf>,
+    bgsub: Option<PathBuf>,
+    profile: Option<PathBuf>,
+    /// BCG center in FITS image coords (0-indexed, as `ds9_icl.py` expects).
+    center: Option<(f64, f64)>,
+}
+
+#[derive(Default, Clone, Debug)]
+struct LsbgState {
+    mask: Option<PathBuf>,
+    cleaned: Option<PathBuf>,
+    segmap: Option<PathBuf>,
+    /// Detection catalog produced by `--mode detect`.
+    detect_catalog: Option<PathBuf>,
+    /// Photometry catalog produced by `--mode photometry`.
+    photo_catalog: Option<PathBuf>,
 }
 
 impl Frame {
@@ -173,6 +202,8 @@ impl Frame {
             cube_mode: CubeMode::default(),
             cat_trim: Vec::new(),
             cat_tag: Vec::new(),
+            icl: IclState::default(),
+            lsbg: LsbgState::default(),
         }
     }
 
@@ -2683,6 +2714,518 @@ fn pipeline_run_stub_task(window: &MainWindow, st: &mut State, label: &str) {
     let _ = run_python_pipeline(window, label, &fits_path, &[]);
 }
 
+// ----------------------------------------------------------------- OGFinder --
+
+/// Locate OGFinder's installation. Honours `$OGFINDER_HOME` first, then falls
+/// back to `/home/kjhan/BACKUP/ds9/OGFinder` (the dev box this project lives
+/// on). Returns the directory containing the `ds9/library/ds9_<name>.py`
+/// scripts, or `None` if neither can be found.
+fn ogfinder_script(name: &str) -> Option<PathBuf> {
+    let candidates: Vec<PathBuf> = std::env::var_os("OGFINDER_HOME")
+        .into_iter()
+        .map(PathBuf::from)
+        .chain(std::iter::once(PathBuf::from("/home/kjhan/BACKUP/ds9/OGFinder")))
+        .collect();
+    for home in candidates {
+        let p = home.join("ds9/library").join(name);
+        if p.exists() { return Some(p); }
+    }
+    None
+}
+
+/// Per-frame scratch directory used by ICL/LSBG stages to stash mask / bkg /
+/// segmap / profile artefacts. Created lazily.
+fn ogfinder_tmp(stage: &str, frame_idx: usize) -> std::io::Result<PathBuf> {
+    let dir = std::env::temp_dir()
+        .join(format!("ds9-rust-{stage}-{}-{frame_idx}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// Write the active frame's catalog as a TSV (no dialog) to `path`. Used by
+/// ICL/LSBG mask stages that need a `--catalog` input. Returns `Ok(())` on
+/// success, `Err(reason)` if there's no catalog or the write fails.
+fn write_catalog_tsv_to(f: &Frame, path: &Path) -> Result<(), String> {
+    let cat = f.catalog.as_ref().ok_or_else(|| "no catalog loaded".to_string())?;
+    let mut buf = String::new();
+    buf.push_str(&cat.columns.join("\t"));
+    buf.push('\n');
+    for r in &cat.rows {
+        buf.push_str(&r.join("\t"));
+        buf.push('\n');
+    }
+    std::fs::write(path, buf).map_err(|e| e.to_string())
+}
+
+/// Run an OGFinder `ds9_*.py` script. Returns `(stdout, success)` so callers
+/// can update the status bar with the last non-empty stdout line on success
+/// or the last stderr line on failure.
+fn run_ogfinder_script(
+    window: &MainWindow,
+    label: &str,
+    script: &Path,
+    fits_path: &Path,
+    args: &[String],
+) -> bool {
+    let py = ["python3", "python"].iter().find_map(|n| {
+        std::process::Command::new(n)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .ok()
+            .map(|_| n.to_string())
+    });
+    let Some(py) = py else {
+        window.set_status_text(format!("{label}: no python3 / python on PATH").into());
+        return false;
+    };
+    let mut cmd = std::process::Command::new(&py);
+    cmd.arg(script).arg(fits_path);
+    for a in args { cmd.arg(a); }
+    window.set_status_text(format!("{label}: running…").into());
+    let output = match cmd.output() {
+        Ok(o) => o,
+        Err(e) => {
+            window.set_status_text(format!("{label}: spawn: {e}").into());
+            return false;
+        }
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    if !output.status.success() {
+        let last = stderr.lines().rev().find(|l| !l.trim().is_empty())
+            .or_else(|| stdout.lines().rev().find(|l| !l.trim().is_empty()))
+            .unwrap_or("(no output)");
+        window.set_status_text(format!("{label} failed: {last}").into());
+        return false;
+    }
+    let summary = stdout.lines().rev().find(|l| !l.trim().is_empty())
+        .unwrap_or("done").to_string();
+    window.set_status_text(format!("{label}: {summary}").into());
+    true
+}
+
+// ---- ICL stage actions ------------------------------------------------------
+
+fn icl_mask(window: &MainWindow, st: &mut State) {
+    let label = "ICL mask";
+    let Some(script) = ogfinder_script("ds9_icl.py") else {
+        window.set_status_text(format!("{label}: ds9_icl.py not found (set $OGFINDER_HOME)").into());
+        return;
+    };
+    let Some((fidx, fits_path)) = active_frame_path(st) else {
+        window.set_status_text(format!("{label}: active frame has no on-disk path").into()); return;
+    };
+    let Ok(tmp) = ogfinder_tmp("icl", fidx) else {
+        window.set_status_text(format!("{label}: tmpdir failed").into()); return;
+    };
+    let cat_path = tmp.join("catalog.tsv");
+    let mask_out = tmp.join("mask.fits");
+    let masked_out = tmp.join("masked.fits");
+    if let Some(f) = st.active_frame() {
+        if f.catalog.is_some() {
+            if let Err(e) = write_catalog_tsv_to(f, &cat_path) {
+                window.set_status_text(format!("{label}: write catalog: {e}").into()); return;
+            }
+        }
+    }
+    let mut args = vec![
+        "--mode".into(), "mask".into(),
+        format!("--mask-output={}", mask_out.display()),
+        format!("--masked-output={}", masked_out.display()),
+    ];
+    if cat_path.exists() {
+        args.push(format!("--catalog={}", cat_path.display()));
+    }
+    if run_ogfinder_script(window, label, &script, &fits_path, &args) {
+        if let Some(f) = st.active_frame_mut() {
+            f.icl.mask = Some(mask_out);
+        }
+    }
+}
+
+fn icl_view_mask(window: &MainWindow, st: &mut State) {
+    let p = st.active_frame().and_then(|f| f.icl.mask.clone());
+    match p {
+        Some(p) if p.exists() => load_into(window, st, &p),
+        _ => window.set_status_text("ICL: no mask yet — run '1. Source Masking' first".into()),
+    }
+}
+
+fn icl_save_mask(window: &MainWindow, st: &State) {
+    let Some(src) = st.active_frame().and_then(|f| f.icl.mask.clone()) else {
+        window.set_status_text("ICL: no mask to save".into()); return;
+    };
+    let chosen = rfd::FileDialog::new()
+        .set_title("Save ICL mask as FITS")
+        .set_file_name("icl_mask.fits")
+        .add_filter("FITS", &["fits", "fit", "fts"])
+        .save_file();
+    let Some(dst) = chosen else { return };
+    match std::fs::copy(&src, &dst) {
+        Ok(_) => window.set_status_text(format!("ICL mask → {}", dst.display()).into()),
+        Err(e) => window.set_status_text(format!("ICL save mask: {e}").into()),
+    }
+}
+
+fn icl_import_mask(window: &MainWindow, st: &mut State) {
+    let chosen = rfd::FileDialog::new()
+        .set_title("Import ICL mask FITS")
+        .add_filter("FITS", &["fits", "fit", "fts"])
+        .pick_file();
+    let Some(p) = chosen else { return };
+    if let Some(f) = st.active_frame_mut() {
+        f.icl.mask = Some(p.clone());
+    }
+    window.set_status_text(format!("ICL: imported mask {}", p.display()).into());
+}
+
+fn icl_background(window: &MainWindow, st: &mut State, method: &str) {
+    let label = "ICL bkg";
+    let Some(script) = ogfinder_script("ds9_icl.py") else {
+        window.set_status_text(format!("{label}: ds9_icl.py not found").into()); return;
+    };
+    let Some((fidx, fits_path)) = active_frame_path(st) else {
+        window.set_status_text(format!("{label}: active frame has no on-disk path").into()); return;
+    };
+    let mask = match st.active_frame().and_then(|f| f.icl.mask.clone()) {
+        Some(m) => m,
+        None => {
+            window.set_status_text(format!("{label}: no mask — run '1. Source Masking' first").into());
+            return;
+        }
+    };
+    let Ok(tmp) = ogfinder_tmp("icl", fidx) else {
+        window.set_status_text(format!("{label}: tmpdir failed").into()); return;
+    };
+    let bkg_out = tmp.join("bkg.fits");
+    let bgsub_out = tmp.join("bgsub.fits");
+    let args = vec![
+        "--mode".into(), "background".into(),
+        format!("--mask={}", mask.display()),
+        format!("--bkg-method={method}"),
+        format!("--bkg-output={}", bkg_out.display()),
+        format!("--bgsub-output={}", bgsub_out.display()),
+    ];
+    if run_ogfinder_script(window, label, &script, &fits_path, &args) {
+        if let Some(f) = st.active_frame_mut() {
+            f.icl.bkg = Some(bkg_out);
+            f.icl.bgsub = Some(bgsub_out);
+        }
+    }
+}
+
+fn icl_view_background(window: &MainWindow, st: &mut State) {
+    let p = st.active_frame().and_then(|f| f.icl.bgsub.clone());
+    match p {
+        Some(p) if p.exists() => load_into(window, st, &p),
+        _ => window.set_status_text("ICL: no background yet — run '2. Background Model' first".into()),
+    }
+}
+
+/// Use the currently selected marker (or last hover position) as the BCG
+/// center for ICL profile extraction.
+fn icl_set_bcg_center(window: &MainWindow, st: &mut State) {
+    let pt = selected_circle_or_center(st).map(|(x, y, _)| (x, y))
+        .or(st.last_hover_fits);
+    let Some((x, y)) = pt else {
+        window.set_status_text("ICL: select a marker or hover the BCG first".into()); return;
+    };
+    if let Some(f) = st.active_frame_mut() {
+        f.icl.center = Some((x, y));
+    }
+    window.set_status_text(format!("ICL: BCG center @ ({x:.1}, {y:.1})").into());
+}
+
+fn icl_measure_profile(window: &MainWindow, st: &mut State) {
+    let label = "ICL profile";
+    let Some(script) = ogfinder_script("ds9_icl.py") else {
+        window.set_status_text(format!("{label}: ds9_icl.py not found").into()); return;
+    };
+    let Some((fidx, fits_path)) = active_frame_path(st) else {
+        window.set_status_text(format!("{label}: active frame has no on-disk path").into()); return;
+    };
+    // ds9_icl.py wants 0-indexed center; our FITS coords are 1-based, convert.
+    let (cx, cy) = match st.active_frame().and_then(|f| f.icl.center) {
+        Some((x, y)) => (x - 1.0, y - 1.0),
+        None => {
+            window.set_status_text(format!("{label}: set BCG center first").into());
+            return;
+        }
+    };
+    let Ok(tmp) = ogfinder_tmp("icl", fidx) else {
+        window.set_status_text(format!("{label}: tmpdir failed").into()); return;
+    };
+    let prof_out = tmp.join("profile.tsv");
+    let args = vec![
+        "--mode".into(), "profile".into(),
+        format!("--center={cx},{cy}"),
+        format!("--profile-output={}", prof_out.display()),
+    ];
+    // mode_profile reads its data straight from the positional FITS arg, so
+    // when a background-subtracted FITS exists, hand *that* to the script
+    // instead of the raw frame.
+    let input_fits = st.active_frame()
+        .and_then(|f| f.icl.bgsub.clone())
+        .unwrap_or(fits_path);
+    if run_ogfinder_script(window, label, &script, &input_fits, &args) {
+        if let Some(f) = st.active_frame_mut() {
+            f.icl.profile = Some(prof_out);
+        }
+    }
+}
+
+fn icl_run_with_profile(window: &MainWindow, st: &mut State, mode: &str, label: &str) {
+    let Some(script) = ogfinder_script("ds9_icl.py") else {
+        window.set_status_text(format!("{label}: ds9_icl.py not found").into()); return;
+    };
+    let Some((_, fits_path)) = active_frame_path(st) else {
+        window.set_status_text(format!("{label}: active frame has no on-disk path").into()); return;
+    };
+    let Some(profile) = st.active_frame().and_then(|f| f.icl.profile.clone()) else {
+        window.set_status_text(format!("{label}: run '3. Measure Profile' first").into()); return;
+    };
+    let args = vec![
+        "--mode".into(), mode.into(),
+        format!("--profile-file={}", profile.display()),
+    ];
+    let _ = run_ogfinder_script(window, label, &script, &fits_path, &args);
+}
+
+// ---- LSBG stage actions -----------------------------------------------------
+
+fn lsbg_mask(window: &MainWindow, st: &mut State) {
+    let label = "LSBG mask";
+    let Some(script) = ogfinder_script("ds9_lsbg.py") else {
+        window.set_status_text(format!("{label}: ds9_lsbg.py not found").into()); return;
+    };
+    let Some((fidx, fits_path)) = active_frame_path(st) else {
+        window.set_status_text(format!("{label}: active frame has no on-disk path").into()); return;
+    };
+    let Ok(tmp) = ogfinder_tmp("lsbg", fidx) else {
+        window.set_status_text(format!("{label}: tmpdir failed").into()); return;
+    };
+    let cat_path = tmp.join("catalog.tsv");
+    let mask_out = tmp.join("mask.fits");
+    let masked_out = tmp.join("masked.fits");
+    if let Some(f) = st.active_frame() {
+        if f.catalog.is_some() {
+            if let Err(e) = write_catalog_tsv_to(f, &cat_path) {
+                window.set_status_text(format!("{label}: write catalog: {e}").into()); return;
+            }
+        }
+    }
+    let mut args = vec![
+        "--mode".into(), "mask".into(),
+        format!("--mask-output={}", mask_out.display()),
+        format!("--masked-output={}", masked_out.display()),
+    ];
+    if cat_path.exists() {
+        args.push(format!("--catalog={}", cat_path.display()));
+    }
+    if run_ogfinder_script(window, label, &script, &fits_path, &args) {
+        if let Some(f) = st.active_frame_mut() {
+            f.lsbg.mask = Some(mask_out);
+        }
+    }
+}
+
+fn lsbg_view_masked(window: &MainWindow, st: &mut State) {
+    // The "masked.fits" from --mode mask is the user-friendly preview.
+    let p = st.active_frame().and_then(|f| {
+        f.lsbg.mask.as_ref().map(|m| m.with_file_name("masked.fits"))
+    });
+    match p {
+        Some(p) if p.exists() => load_into(window, st, &p),
+        _ => window.set_status_text("LSBG: no masked image yet — run '1. Mask Bright Sources'".into()),
+    }
+}
+
+fn lsbg_save_mask(window: &MainWindow, st: &State) {
+    let Some(src) = st.active_frame().and_then(|f| f.lsbg.mask.clone()) else {
+        window.set_status_text("LSBG: no mask to save".into()); return;
+    };
+    let chosen = rfd::FileDialog::new()
+        .set_title("Save LSBG mask as FITS")
+        .set_file_name("lsbg_mask.fits")
+        .add_filter("FITS", &["fits", "fit", "fts"])
+        .save_file();
+    let Some(dst) = chosen else { return };
+    match std::fs::copy(&src, &dst) {
+        Ok(_) => window.set_status_text(format!("LSBG mask → {}", dst.display()).into()),
+        Err(e) => window.set_status_text(format!("LSBG save mask: {e}").into()),
+    }
+}
+
+fn lsbg_import_mask(window: &MainWindow, st: &mut State) {
+    let chosen = rfd::FileDialog::new()
+        .set_title("Import LSBG mask FITS")
+        .add_filter("FITS", &["fits", "fit", "fts"])
+        .pick_file();
+    let Some(p) = chosen else { return };
+    if let Some(f) = st.active_frame_mut() {
+        f.lsbg.mask = Some(p.clone());
+    }
+    window.set_status_text(format!("LSBG: imported mask {}", p.display()).into());
+}
+
+fn lsbg_clean(window: &MainWindow, st: &mut State, method: &str) {
+    let label = "LSBG clean";
+    let Some(script) = ogfinder_script("ds9_lsbg.py") else {
+        window.set_status_text(format!("{label}: ds9_lsbg.py not found").into()); return;
+    };
+    let Some((fidx, fits_path)) = active_frame_path(st) else {
+        window.set_status_text(format!("{label}: active frame has no on-disk path").into()); return;
+    };
+    let mask = match st.active_frame().and_then(|f| f.lsbg.mask.clone()) {
+        Some(m) => m,
+        None => {
+            window.set_status_text(format!("{label}: no mask — run '1. Mask Bright Sources' first").into());
+            return;
+        }
+    };
+    let Ok(tmp) = ogfinder_tmp("lsbg", fidx) else {
+        window.set_status_text(format!("{label}: tmpdir failed").into()); return;
+    };
+    let cleaned_out = tmp.join("cleaned.fits");
+    let args = vec![
+        "--mode".into(), "clean".into(),
+        format!("--mask={}", mask.display()),
+        format!("--bkg-method={method}"),
+        format!("--cleaned-output={}", cleaned_out.display()),
+    ];
+    if run_ogfinder_script(window, label, &script, &fits_path, &args) {
+        if let Some(f) = st.active_frame_mut() {
+            f.lsbg.cleaned = Some(cleaned_out);
+        }
+    }
+}
+
+fn lsbg_view_cleaned(window: &MainWindow, st: &mut State) {
+    let p = st.active_frame().and_then(|f| f.lsbg.cleaned.clone());
+    match p {
+        Some(p) if p.exists() => load_into(window, st, &p),
+        _ => window.set_status_text("LSBG: no cleaned image yet — run '2. Background Model' first".into()),
+    }
+}
+
+fn lsbg_detect(window: &MainWindow, st: &mut State) {
+    let label = "LSBG detect";
+    let Some(script) = ogfinder_script("ds9_lsbg.py") else {
+        window.set_status_text(format!("{label}: ds9_lsbg.py not found").into()); return;
+    };
+    let Some((fidx, fits_path)) = active_frame_path(st) else {
+        window.set_status_text(format!("{label}: active frame has no on-disk path").into()); return;
+    };
+    let cleaned = match st.active_frame().and_then(|f| f.lsbg.cleaned.clone()) {
+        Some(c) => c,
+        None => {
+            window.set_status_text(format!("{label}: no cleaned image — run '2. Background Model' first").into());
+            return;
+        }
+    };
+    let Ok(tmp) = ogfinder_tmp("lsbg", fidx) else {
+        window.set_status_text(format!("{label}: tmpdir failed").into()); return;
+    };
+    let segmap_out = tmp.join("segmap.fits");
+    let cat_out = tmp.join("detect.tsv");
+    let args = vec![
+        "--mode".into(), "detect".into(),
+        format!("--cleaned={}", cleaned.display()),
+        format!("--segmap-output={}", segmap_out.display()),
+        format!("--catalog-output={}", cat_out.display()),
+    ];
+    if run_ogfinder_script(window, label, &script, &fits_path, &args) {
+        if let Some(f) = st.active_frame_mut() {
+            f.lsbg.segmap = Some(segmap_out);
+            f.lsbg.detect_catalog = Some(cat_out.clone());
+        }
+        // Load the detection catalog so the user can see candidates.
+        if let Ok(cat) = Catalog::from_path(&cat_out) {
+            let n = cat.len();
+            if let Some(f) = st.active_frame_mut() {
+                f.catalog = Some(cat);
+                f.selected_catalog = None;
+                f.sync_catalog_aux();
+            }
+            window.set_status_text(format!("LSBG detect: {n} candidates").into());
+            refresh_view(window, st);
+        }
+    }
+}
+
+fn lsbg_photometry(window: &MainWindow, st: &mut State) {
+    let label = "LSBG photometry";
+    let Some(script) = ogfinder_script("ds9_lsbg.py") else {
+        window.set_status_text(format!("{label}: ds9_lsbg.py not found").into()); return;
+    };
+    let Some((fidx, fits_path)) = active_frame_path(st) else {
+        window.set_status_text(format!("{label}: active frame has no on-disk path").into()); return;
+    };
+    let (Some(cleaned), Some(segmap), Some(detect_cat)) = (
+        st.active_frame().and_then(|f| f.lsbg.cleaned.clone()),
+        st.active_frame().and_then(|f| f.lsbg.segmap.clone()),
+        st.active_frame().and_then(|f| f.lsbg.detect_catalog.clone()),
+    ) else {
+        window.set_status_text(format!("{label}: need cleaned + segmap + detect catalog (run steps 2–3 first)").into());
+        return;
+    };
+    let Ok(tmp) = ogfinder_tmp("lsbg", fidx) else {
+        window.set_status_text(format!("{label}: tmpdir failed").into()); return;
+    };
+    let photo_out = tmp.join("photometry.tsv");
+    let args = vec![
+        "--mode".into(), "photometry".into(),
+        format!("--cleaned={}", cleaned.display()),
+        format!("--segmap={}", segmap.display()),
+        format!("--catalog={}", detect_cat.display()),
+        format!("--catalog-output={}", photo_out.display()),
+    ];
+    if run_ogfinder_script(window, label, &script, &fits_path, &args) {
+        if let Some(f) = st.active_frame_mut() {
+            f.lsbg.photo_catalog = Some(photo_out.clone());
+        }
+        if let Ok(cat) = Catalog::from_path(&photo_out) {
+            let n = cat.len();
+            if let Some(f) = st.active_frame_mut() {
+                f.catalog = Some(cat);
+                f.selected_catalog = None;
+                f.sync_catalog_aux();
+            }
+            window.set_status_text(format!("LSBG photometry: {n} rows").into());
+            refresh_view(window, st);
+        }
+    }
+}
+
+/// Run an LSBG mode that doesn't require new I/O wiring beyond the photometry
+/// catalog produced upstream. Used by `sersic`, `filter`, `svm-classify`,
+/// `forced`, `run` (full-pipeline). Falls back to "needs photo catalog" when
+/// there isn't one yet.
+fn lsbg_run_mode(window: &MainWindow, st: &mut State, mode: &str, label: &str) {
+    let Some(script) = ogfinder_script("ds9_lsbg.py") else {
+        window.set_status_text(format!("{label}: ds9_lsbg.py not found").into()); return;
+    };
+    let Some((_, fits_path)) = active_frame_path(st) else {
+        window.set_status_text(format!("{label}: active frame has no on-disk path").into()); return;
+    };
+    let mut args = vec!["--mode".into(), mode.into()];
+    if let Some(cat) = st.active_frame().and_then(|f| f.lsbg.photo_catalog.clone()) {
+        args.push(format!("--catalog={}", cat.display()));
+    }
+    if let Some(cleaned) = st.active_frame().and_then(|f| f.lsbg.cleaned.clone()) {
+        args.push(format!("--cleaned={}", cleaned.display()));
+    }
+    if let Some(segmap) = st.active_frame().and_then(|f| f.lsbg.segmap.clone()) {
+        args.push(format!("--segmap={}", segmap.display()));
+    }
+    if let Some(mask) = st.active_frame().and_then(|f| f.lsbg.mask.clone()) {
+        args.push(format!("--mask={}", mask.display()));
+    }
+    let _ = run_ogfinder_script(window, label, &script, &fits_path, &args);
+}
+
 /// Apply a textual trim expression to the active frame's `cat_trim`. Supports
 /// simple `<column> <op> <value>` clauses chained with `and` / `or`.
 /// Empty expression resets the trim mask.
@@ -2848,22 +3391,37 @@ fn catwin_menu_action(
             );
         }
 
-        // -------- ICL --------
-        ("ICL", "1. Source Masking")
-            | ("ICL", "4. ICL Measurements")
-            | ("ICL", "4. Multi-Threshold ICL")
-            | ("ICL", "5. BCG+ICL Decomposition")
-            => pipeline_run_region_text_task(window, st, "icl"),
+        // -------- ICL (multi-stage; each step feeds the next via Frame::icl) --------
+        ("ICL", "1. Source Masking")    => icl_mask(window, st),
+        ("ICL", "1. View Mask")         => icl_view_mask(window, st),
+        ("ICL", "1. Save Mask As…")     => icl_save_mask(window, st),
+        ("ICL", "1. Import Mask…")      => icl_import_mask(window, st),
+        ("ICL", "2. Background: Polynomial Fit") => icl_background(window, st, "polynomial"),
+        ("ICL", "2. Background: Chebyshev Fit")  => icl_background(window, st, "chebyshev"),
+        ("ICL", "2. Background: SEP Large Mesh") => icl_background(window, st, "sep_large"),
+        ("ICL", "2. View Background")   => icl_view_background(window, st),
+        ("ICL", "3. Set BCG Center")    => icl_set_bcg_center(window, st),
+        ("ICL", "3. Measure Profile")   => icl_measure_profile(window, st),
+        ("ICL", "4. ICL Measurements")  => icl_run_with_profile(window, st, "measure",       "ICL measure"),
+        ("ICL", "4. Multi-Threshold ICL") => icl_run_with_profile(window, st, "measure-multi", "ICL multi"),
+        ("ICL", "5. BCG+ICL Decomposition") => icl_run_with_profile(window, st, "decompose", "ICL decomp"),
 
-        // -------- LSBG --------
-        ("LSBG", "1. Mask Bright Sources")
-            | ("LSBG", "3. Detect LSBG Candidates")
-            | ("LSBG", "4. Photometry")
-            | ("LSBG", "5. Sérsic Profile Fit")
-            | ("LSBG", "6. Filter + Grade")
-            | ("LSBG", "7. SVM Classify")
-            | ("LSBG", "Run Full Pipeline")
-            => pipeline_run_catalog_task(window, st, "lsbg", vec![]),
+        // -------- LSBG (multi-stage; each step feeds the next via Frame::lsbg) --------
+        ("LSBG", "1. Mask Bright Sources") => lsbg_mask(window, st),
+        ("LSBG", "1. View Masked Image")   => lsbg_view_masked(window, st),
+        ("LSBG", "1. Save Mask As…")       => lsbg_save_mask(window, st),
+        ("LSBG", "1. Import Mask…")        => lsbg_import_mask(window, st),
+        ("LSBG", "2. Background: SEP Large Mesh") => lsbg_clean(window, st, "sep_large"),
+        ("LSBG", "2. Background: Polynomial Fit") => lsbg_clean(window, st, "polynomial"),
+        ("LSBG", "2. Background: Chebyshev Fit")  => lsbg_clean(window, st, "chebyshev"),
+        ("LSBG", "2. View Cleaned Image")  => lsbg_view_cleaned(window, st),
+        ("LSBG", "3. Detect LSBG Candidates") => lsbg_detect(window, st),
+        ("LSBG", "4. Photometry")          => lsbg_photometry(window, st),
+        ("LSBG", "5. Sérsic Profile Fit")  => lsbg_run_mode(window, st, "sersic",       "LSBG sersic"),
+        ("LSBG", "6. Filter + Grade")      => lsbg_run_mode(window, st, "filter",       "LSBG filter"),
+        ("LSBG", "7. SVM Classify")        => lsbg_run_mode(window, st, "svm-classify", "LSBG svm"),
+        ("LSBG", "8. Forced Photometry (Multi-Band)") => lsbg_run_mode(window, st, "forced", "LSBG forced"),
+        ("LSBG", "Run Full Pipeline")      => lsbg_run_mode(window, st, "run", "LSBG full"),
         ("LSBG", "Save Catalog…") => catalog_export_tsv(window, st),
         ("LSBG", "Load Catalog…") => catalog_load(window, st),
 
