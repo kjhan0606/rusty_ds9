@@ -795,9 +795,10 @@ export component MainWindow inherits Window {
         self.view-zoom = new-zoom;
     }
 
+    forward-focus: fs;
     fs := FocusScope {
-        width:  100%;
-        height: 100%;
+        width: 0px;
+        height: 0px;
         // capture single-letter shortcuts (A/D/S/M/V) for OGFinder-style
         // catalog interaction. We forward Latin letters to Rust verbatim.
         key-pressed(e) => {
@@ -807,10 +808,9 @@ export component MainWindow inherits Window {
             }
             accept
         }
+    }
 
     VerticalLayout {
-        width:  parent.width;
-        height: parent.height;
         spacing: 0px;
 
         // ---------------- menu bar ----------------
@@ -1762,8 +1762,5 @@ export component MainWindow inherits Window {
                 }
             }
         }
-    }
-
-        init => { fs.focus(); }
     }
 }
