@@ -796,6 +796,8 @@ export component MainWindow inherits Window {
     }
 
     fs := FocusScope {
+        width:  100%;
+        height: 100%;
         // capture single-letter shortcuts (A/D/S/M/V) for OGFinder-style
         // catalog interaction. We forward Latin letters to Rust verbatim.
         key-pressed(e) => {
@@ -807,6 +809,8 @@ export component MainWindow inherits Window {
         }
 
     VerticalLayout {
+        width:  parent.width;
+        height: parent.height;
         spacing: 0px;
 
         // ---------------- menu bar ----------------
